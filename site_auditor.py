@@ -6,20 +6,28 @@ Uses Playwright to handle dynamic content.
 Usage:
     python site_auditor.py https://example.com
     python site_auditor.py https://example.com --max-pages 100 --check-external
+    python site_auditor.py https://example.com --search-term GMC
 """
 
 import argparse
 import csv
+import re
 import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+from html import escape
 from urllib.parse import urljoin, urlparse
 
 import requests as req_lib
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+except ModuleNotFoundError:
+    sync_playwright = None
+    PlaywrightTimeout = TimeoutError
 
 
 @dataclass
@@ -34,6 +42,16 @@ class LinkResult:
 
 
 @dataclass
+class SearchResult:
+    page_url: str
+    match_type: str
+    matched_text: str
+    context: str
+    target_url: str = ""
+    is_external: bool = False
+
+
+@dataclass
 class AuditReport:
     base_url: str
     total_pages_crawled: int = 0
@@ -42,6 +60,8 @@ class AuditReport:
     redirects: list = field(default_factory=list)
     working_links: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    search_term: str = ""
+    search_matches: list = field(default_factory=list)
 
 
 class SiteAuditor:
@@ -53,6 +73,7 @@ class SiteAuditor:
         timeout: int = 60000,
         verbose: bool = True,
         max_retries: int = 2,
+        search_term: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.base_domain = urlparse(base_url).netloc
@@ -61,11 +82,18 @@ class SiteAuditor:
         self.timeout = timeout
         self.verbose = verbose
         self.max_retries = max_retries
+        self.search_term = search_term.strip()
+        self.search_pattern = (
+            re.compile(re.escape(self.search_term), re.IGNORECASE)
+            if self.search_term
+            else None
+        )
 
         self.visited_urls: set = set()
         self.checked_links: set = set()
         self.to_crawl: deque = deque()
         self.report = AuditReport(base_url=base_url)
+        self.report.search_term = self.search_term
 
     def log(self, message: str):
         if self.verbose:
@@ -112,6 +140,74 @@ class SiteAuditor:
         except Exception as e:
             self.log(f"  Error extracting links: {e}")
         return links
+
+    def extract_page_text(self, page) -> str:
+        """Extract visible body text from the current page."""
+        try:
+            return page.locator("body").inner_text(timeout=5000)
+        except Exception as e:
+            self.log(f"  Error extracting page text: {e}")
+            return ""
+
+    def _snippet_around_match(self, text: str, start: int, end: int, radius: int = 80) -> str:
+        """Return a compact, single-line snippet around a text match."""
+        snippet_start = max(0, start - radius)
+        snippet_end = min(len(text), end + radius)
+        snippet = text[snippet_start:snippet_end]
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+        if snippet_start > 0:
+            snippet = "…" + snippet
+        if snippet_end < len(text):
+            snippet += "…"
+        return snippet
+
+    def collect_search_matches(
+        self,
+        page,
+        current_url: str,
+        links: list[tuple[str, str]],
+    ):
+        """Collect page-text and link matches for the configured search term."""
+        if not self.search_pattern:
+            return
+
+        page_text = self.extract_page_text(page)
+        page_matches = list(self.search_pattern.finditer(page_text))
+        for match in page_matches:
+            self.report.search_matches.append(
+                SearchResult(
+                    page_url=current_url,
+                    match_type="Page Text",
+                    matched_text=match.group(0),
+                    context=self._snippet_around_match(page_text, match.start(), match.end()),
+                )
+            )
+
+        for href, link_text in links:
+            normalized = self.normalize_url(href, current_url)
+            if not normalized:
+                continue
+
+            link_blob = f"{link_text} {normalized}"
+            link_match = self.search_pattern.search(link_blob)
+            if not link_match:
+                continue
+
+            matched_text = link_match.group(0)
+            context = link_text if self.search_pattern.search(link_text) else normalized
+            self.report.search_matches.append(
+                SearchResult(
+                    page_url=current_url,
+                    match_type="Link",
+                    matched_text=matched_text,
+                    context=context,
+                    target_url=normalized,
+                    is_external=not self.is_internal_url(normalized),
+                )
+            )
+
+        if page_matches:
+            self.log(f"  Found {len(page_matches)} page-text matches for '{self.search_term}'")
 
     def check_link(self, url: str, source_page: str, link_text: str) -> LinkResult:
         """Check if a link is working using requests library. Detects redirects by comparing final URL."""
@@ -221,7 +317,18 @@ class SiteAuditor:
 
     def crawl(self):
         """Main crawl loop."""
-        self.log(f"Starting audit of {self.base_url}")
+        if sync_playwright is None:
+            raise RuntimeError(
+                "Playwright is not installed. Install dependencies with "
+                "`pip install playwright requests` and then run `playwright install chromium`."
+            )
+
+        mode_label = (
+            f"content search for '{self.search_term}'"
+            if self.search_term
+            else "broken-link audit"
+        )
+        self.log(f"Starting {mode_label} of {self.base_url}")
         pages_label = "unlimited" if self.max_pages == 0 else str(self.max_pages)
         self.log(f"Max pages: {pages_label}, Check external: {self.check_external}")
         self.log("-" * 60)
@@ -260,6 +367,8 @@ class SiteAuditor:
                     links = self.extract_links(page)
                     self.log(f"  Found {len(links)} links")
 
+                    self.collect_search_matches(page, current_url, links)
+
                     to_check = []
                     for href, link_text in links:
                         normalized = self.normalize_url(href, current_url)
@@ -272,8 +381,10 @@ class SiteAuditor:
                         if not is_external and normalized not in self.visited_urls:
                             self.to_crawl.append(normalized)
 
-                        # Queue link for batch checking
-                        if normalized not in self.checked_links:
+                        # Queue link for batch checking. In search mode, crawling still
+                        # follows internal links, but link validation is intentionally
+                        # skipped so the run answers "where does this term appear?"
+                        if not self.search_term and normalized not in self.checked_links:
                             if not is_external or self.check_external:
                                 self.checked_links.add(normalized)
                                 to_check.append((normalized, current_url, link_text))
@@ -314,6 +425,10 @@ class SiteAuditor:
 
     def generate_csv_report(self, filename: str):
         """Generate a CSV report of all findings."""
+        if self.search_term:
+            self.generate_search_csv_report(filename)
+            return
+
         with open(filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Status", "URL", "Found On", "Link Text", "Type", "Redirects To", "Error"])
@@ -368,8 +483,39 @@ class SiteAuditor:
 
         self.log(f"CSV report saved to: {filename}")
 
+    def generate_search_csv_report(self, filename: str):
+        """Generate a CSV report for content-search findings."""
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Search Term",
+                "Page URL",
+                "Match Type",
+                "Matched Text",
+                "Context",
+                "Target URL",
+                "Type",
+            ])
+
+            for result in self.report.search_matches:
+                writer.writerow([
+                    self.search_term,
+                    result.page_url,
+                    result.match_type,
+                    result.matched_text,
+                    result.context,
+                    result.target_url,
+                    "External" if result.is_external else "Internal",
+                ])
+
+        self.log(f"CSV search report saved to: {filename}")
+
     def generate_html_report(self, filename: str):
         """Generate an HTML report."""
+        if self.search_term:
+            self.generate_search_html_report(filename)
+            return
+
         html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -495,8 +641,103 @@ class SiteAuditor:
 
         self.log(f"HTML report saved to: {filename}")
 
+    def generate_search_html_report(self, filename: str):
+        """Generate an HTML report for content-search findings."""
+        safe_base_url = escape(self.base_url)
+        safe_search_term = escape(self.search_term)
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Site Search Report - {safe_base_url}</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; }}
+        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .stat {{ background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }}
+        .stat-number {{ font-size: 2em; font-weight: bold; color: #007bff; }}
+        .stat-label {{ color: #666; margin-top: 5px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; vertical-align: top; }}
+        th {{ background: #f8f9fa; font-weight: 600; }}
+        tr:hover {{ background: #f8f9fa; }}
+        .url {{ max-width: 360px; word-break: break-all; }}
+        .context {{ max-width: 420px; }}
+        .badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; background: #e7f1ff; color: #084298; font-size: 0.85em; }}
+        .external {{ font-size: 0.8em; color: #6c757d; }}
+        mark {{ background: #fff3cd; padding: 0 2px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔎 Site Search Report</h1>
+        <p><strong>URL:</strong> {safe_base_url}<br>
+        <strong>Search term:</strong> {safe_search_term}<br>
+        <strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+        <div class="summary">
+            <div class="stat">
+                <div class="stat-number">{self.report.total_pages_crawled}</div>
+                <div class="stat-label">Pages Crawled</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">{len(self.report.search_matches)}</div>
+                <div class="stat-label">Matches Found</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">{len([m for m in self.report.search_matches if m.match_type == 'Page Text'])}</div>
+                <div class="stat-label">Page Text Matches</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">{len([m for m in self.report.search_matches if m.match_type == 'Link'])}</div>
+                <div class="stat-label">Link Matches</div>
+            </div>
+        </div>
+"""
+
+        if self.report.search_matches:
+            html += """
+        <h2>Matches</h2>
+        <table>
+            <tr><th>Type</th><th>Page</th><th>Context</th><th>Target URL</th></tr>
+"""
+            for result in self.report.search_matches:
+                ext = ' <span class="external">(external)</span>' if result.is_external else ""
+                safe_context = escape(result.context)
+                safe_context = self.search_pattern.sub(
+                    lambda match: f"<mark>{escape(match.group(0))}</mark>",
+                    safe_context,
+                )
+                target = escape(result.target_url) + ext if result.target_url else ""
+                html += f"""            <tr>
+                <td><span class="badge">{escape(result.match_type)}</span></td>
+                <td class="url">{escape(result.page_url)}</td>
+                <td class="context">{safe_context}</td>
+                <td class="url">{target}</td>
+            </tr>
+"""
+            html += "        </table>\n"
+        else:
+            html += f"        <p>No matches found for <strong>{safe_search_term}</strong>.</p>\n"
+
+        html += """
+    </div>
+</body>
+</html>
+"""
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        self.log(f"HTML search report saved to: {filename}")
+
     def print_summary(self):
         """Print a summary to console."""
+        if self.search_term:
+            self.print_search_summary()
+            return
+
         print("\n" + "=" * 60)
         print("AUDIT SUMMARY")
         print("=" * 60)
@@ -533,10 +774,39 @@ class SiteAuditor:
             if len(self.report.errors) > 20:
                 print(f"  ... and {len(self.report.errors) - 20} more")
 
+    def print_search_summary(self):
+        """Print a content-search summary to console."""
+        text_matches = [m for m in self.report.search_matches if m.match_type == "Page Text"]
+        link_matches = [m for m in self.report.search_matches if m.match_type == "Link"]
+
+        print("\n" + "=" * 60)
+        print("SEARCH SUMMARY")
+        print("=" * 60)
+        print(f"Base URL:        {self.base_url}")
+        print(f"Search term:     {self.search_term}")
+        print(f"Pages crawled:   {self.report.total_pages_crawled}")
+        print(f"Matches found:   {len(self.report.search_matches)}")
+        print(f"Page text:       {len(text_matches)}")
+        print(f"Links:           {len(link_matches)}")
+        print("=" * 60)
+
+        if self.report.search_matches:
+            print("\nMATCHES:")
+            for result in self.report.search_matches[:20]:
+                print(f"  [{result.match_type}] {result.page_url}")
+                if result.target_url:
+                    print(f"       Target: {result.target_url}")
+                print(f"       Context: {result.context[:160]}")
+            if len(self.report.search_matches) > 20:
+                print(f"  ... and {len(self.report.search_matches) - 20} more")
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Crawl a website and check for broken links (handles JavaScript sites)"
+        description=(
+            "Crawl a website and check for broken links, or search crawled pages "
+            "for a word/phrase (handles JavaScript sites)"
+        )
     )
     parser.add_argument("url", help="The URL to audit")
     parser.add_argument(
@@ -554,6 +824,13 @@ def main():
     parser.add_argument(
         "--format", "-f", choices=["html", "csv", "both"], default="both", help="Output format"
     )
+    parser.add_argument(
+        "--search-term",
+        help=(
+            "Search crawled pages and discovered links for this word/phrase instead "
+            "of validating links, e.g. --search-term GMC"
+        ),
+    )
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress verbose output")
 
     args = parser.parse_args()
@@ -569,6 +846,7 @@ def main():
         check_external=args.check_external,
         timeout=args.timeout,
         verbose=not args.quiet,
+        search_term=args.search_term or "",
     )
 
     try:

@@ -1,6 +1,6 @@
 # Site Link Auditor
 
-A command-line tool that crawls websites and generates detailed reports of broken links, redirects, and errors. Uses Playwright for browser automation, so it handles JavaScript-rendered pages that simple HTTP scrapers would miss.
+A command-line tool that crawls websites and generates detailed reports of broken links, redirects, errors, or word/phrase matches found across a site. Uses Playwright for browser automation, so it handles JavaScript-rendered pages that simple HTTP scrapers would miss.
 
 ## What It Does
 
@@ -8,6 +8,7 @@ A command-line tool that crawls websites and generates detailed reports of broke
 - Discovers all internal pages via breadth-first traversal
 - Checks every link found on each page (internal and optionally external)
 - Detects broken links (4xx/5xx), redirects, and connection errors
+- Can search the crawled site for a word or phrase, such as `GMC`, instead of validating links
 - Generates reports in HTML and/or CSV format
 - Handles interruptions gracefully (Ctrl+C saves a partial report)
 
@@ -86,6 +87,14 @@ python site_auditor.py https://example.com
 python site_auditor.py https://example.com --check-external
 ```
 
+### Search a site for a word or phrase instead of checking broken links
+
+```bash
+python site_auditor.py https://example.com --search-term GMC -o reports/gmc_search -f both
+```
+
+Search mode still crawls internal pages from the provided site, but it skips HTTP link validation. The report lists page-text matches and link matches whose text or URL contains the search term.
+
 ### Limit the number of pages crawled
 
 ```bash
@@ -120,11 +129,12 @@ python site_auditor.py https://example.com --check-external --max-pages 200 --ti
 | `--timeout` | `60000` | Page load timeout in milliseconds |
 | `-o`, `--output` | `audit_report` | Output filename (without extension) |
 | `-f`, `--format` | `both` | Output format: `html`, `csv`, or `both` |
+| `--search-term` | *(not set)* | Search crawled page text and discovered links for a word/phrase instead of validating links |
 | `-q`, `--quiet` | off | Suppress verbose per-page output |
 
 ## Output
 
-### HTML Report
+### Broken-Link HTML Report
 
 A styled, self-contained HTML page with:
 
@@ -151,13 +161,27 @@ A spreadsheet-compatible CSV with columns:
 
 Rows are ordered: broken links first, then errors, redirects, and working links.
 
+### Search Report
+
+When `--search-term` is provided, the HTML and CSV reports switch to search findings with:
+
+- Search term
+- Page URL where the match was found
+- Match type (`Page Text` or `Link`)
+- Matched text
+- Context snippet
+- Target URL for link matches
+- Internal/external classification for link matches
+
 ## How It Works
 
 1. **Crawl phase** -- Playwright launches headless Chromium and loads each page, waiting for JavaScript to render. Links are extracted from the DOM (`a[href]` elements). Internal links are queued for further crawling in breadth-first order.
 
 2. **Link checking phase** -- Each unique link is validated using HTTP HEAD requests (falling back to GET if HEAD returns 405 or fails). Links are checked in parallel using a thread pool (10 concurrent workers). A link is classified as broken if it returns a 4xx/5xx status, a redirect if the final URL differs from the original, or an error if the request fails entirely.
 
-3. **Report generation** -- Results are written to HTML and/or CSV files. If the crawl is interrupted with Ctrl+C, partial reports are saved with a `_partial` suffix.
+3. **Search phase** -- If `--search-term` is provided, link checking is skipped. The crawler searches visible page text plus discovered link text/URLs for case-insensitive matches.
+
+4. **Report generation** -- Results are written to HTML and/or CSV files. If the crawl is interrupted with Ctrl+C, partial reports are saved with a `_partial` suffix.
 
 ## Project Structure
 
