@@ -4,7 +4,7 @@ Crawl a website with a real (headless) browser and get an HTML/CSV report of eit
 
 - **Broken links** — 4xx/5xx, redirects and connection errors (default mode), or
 - **Where a word or phrase appears** — e.g. every page that mentions `"Royal Motors"` (`--search-term`), or
-- **Images missing `alt` or `title`** (`--check-images`).
+- **Images missing `alt` and/or `title`** (`--check-images`, or `--alt-only` / `--title-only`).
 
 Any mode can be limited to the pages listed on the site's sitemap page (`--sitemap-only`).
 
@@ -71,6 +71,8 @@ playwright install chromium
 | Find every page mentioning a word | `python site_auditor.py https://example.com --search-term GMC -o reports/gmc` |
 | Find a multi-word phrase | `python site_auditor.py https://example.com --search-term "Royal Motors" -o reports/royal` |
 | Find images without alt/title | `python site_auditor.py https://example.com --check-images -o reports/images` |
+| …only missing alt | `python site_auditor.py https://example.com --alt-only -o reports/alt` |
+| …only missing title | `python site_auditor.py https://example.com --title-only -o reports/title` |
 | …only on sitemap pages, without inventory | `python site_auditor.py https://example.com/sitemap.htm --sitemap-only --skip-inventory --check-images -o reports/images` |
 | Test quickly on a few pages | add `--max-pages 20` |
 | Ignore dealer inventory / blog pages | add `--skip-inventory --skip-blogs` |
@@ -118,12 +120,20 @@ Notes:
 
 Crawls the same way but **does not check links**. Instead it reports every `<img>` on each page whose `alt` or `title` attribute is missing or empty.
 
-- **Missing** column values: `alt`, `title`, `alt (empty)`, `title (empty)`, or combinations like `alt, title`. Filter the CSV by this column — e.g. keep only rows containing `alt` if you only care about alt text.
+| Flag | Checks |
+|---|---|
+| `--check-images` | both `alt` and `title` (an image is reported if either is missing) |
+| `--alt-only` | only `alt` |
+| `--title-only` | only `title` |
+
+`--alt-only` and `--title-only` turn on image mode by themselves (no need to also pass `--check-images`) and can't be used together.
+
+- **Missing** column values: `alt`, `title`, `alt (empty)`, `title (empty)`, or combinations like `alt, title` (only the attributes being checked).
 - `alt=""` is reported as `alt (empty)`. It is valid for purely decorative images, so review those before fixing.
 - 1×1 tracking pixels are ignored. Lazy-loaded images are covered when the URL is in `src` or `data-src`.
 - Only `<img>` tags are checked — not CSS background images or inline `<svg>`. Images the site only adds after scrolling may be missed.
 - Shared images (logo, header, footer) appear on every page. The HTML report lists each image **once** with the pages it appears on; the CSV has one row per page.
-- Cannot be combined with `--search-term`.
+- None of the image flags can be combined with `--search-term`.
 
 ### Limiting to the sitemap (`--sitemap-only`)
 
@@ -178,6 +188,8 @@ The starting URL is never skipped.
 | `-f`, `--format` | `both` | `html`, `csv` or `both`. |
 | `--search-term TEXT` | — | Switch to content-search mode. Quote multi-word phrases. |
 | `--check-images` | off | Switch to image mode: report `<img>` elements missing `alt` or `title`. |
+| `--alt-only` | off | Image mode checking only `alt` (implies `--check-images`). |
+| `--title-only` | off | Image mode checking only `title` (implies `--check-images`). |
 | `--sitemap-only` | off | Only visit the start URL and the internal pages it links to (pass the sitemap page as `url`). |
 | `--skip-inventory` | off | Skip vehicle detail pages and faceted inventory searches. |
 | `--skip-blogs` | off | Skip `/blog/` pages. |
@@ -227,7 +239,7 @@ Each run prints a summary to the console and writes `<output>.html` and/or `<out
 
 ### Image reports
 
-**HTML**: summary cards (pages crawled, images checked, missing alt, missing title, pages with issues, URLs skipped) and a table with one row per image: preview, URL, what's missing, and a collapsible list of pages where it appears. Most widespread images first.
+**HTML**: summary cards (pages crawled, images checked, missing alt and/or missing title, pages with issues, URLs skipped) and a table with one row per image: preview, URL, what's missing, and a collapsible list of pages where it appears. Most widespread images first.
 
 **CSV** — one row per image per page:
 

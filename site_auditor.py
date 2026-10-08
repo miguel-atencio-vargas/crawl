@@ -9,6 +9,7 @@ Usage:
     python site_auditor.py https://example.com --search-term GMC
     python site_auditor.py https://example.com --skip-inventory --skip-blogs
     python site_auditor.py https://example.com/sitemap.htm --sitemap-only --check-images --skip-inventory
+    python site_auditor.py https://example.com --alt-only
 """
 
 import argparse
@@ -103,6 +104,7 @@ class SiteAuditor:
         search_term: str = "",
         skip_patterns: list[str] | None = None,
         check_images: bool = False,
+        image_attrs: tuple[str, ...] = ("alt", "title"),
         sitemap_only: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
@@ -121,6 +123,8 @@ class SiteAuditor:
 
         self.skip_patterns = [re.compile(p, re.IGNORECASE) for p in (skip_patterns or [])]
         self.check_images = check_images
+        self.image_attrs = image_attrs
+        self.image_label = "/".join(image_attrs)  # "alt/title", "alt" or "title"
         self.sitemap_only = sitemap_only
         # Search and image modes answer a different question, so they skip
         # HTTP link validation.
@@ -255,7 +259,7 @@ class SiteAuditor:
             self.log(f"  Found {len(page_matches)} page-text matches for '{self.search_term}'")
 
     def collect_image_issues(self, page, current_url: str):
-        """Record <img> elements whose alt or title attribute is missing or empty."""
+        """Record <img> elements whose checked attributes (alt/title) are missing or empty."""
         if not self.check_images:
             return
 
@@ -281,7 +285,7 @@ class SiteAuditor:
             self.report.images_checked += 1
 
             missing = []
-            for attr in ("alt", "title"):
+            for attr in self.image_attrs:
                 value = img[attr]
                 if value is None:
                     missing.append(attr)
@@ -307,7 +311,7 @@ class SiteAuditor:
             issues += 1
 
         if issues:
-            self.log(f"  Found {issues} images missing alt/title")
+            self.log(f"  Found {issues} images missing {self.image_label}")
 
     def check_link(self, url: str, source_page: str, link_text: str) -> LinkResult:
         """Check if a link is working using requests library. Detects redirects by comparing final URL."""
@@ -426,7 +430,7 @@ class SiteAuditor:
         if self.search_term:
             mode_label = f"content search for '{self.search_term}'"
         elif self.check_images:
-            mode_label = "image alt/title audit"
+            mode_label = f"image {self.image_label} audit"
         else:
             mode_label = "broken-link audit"
         self.log(f"Starting {mode_label} of {self.base_url}")
@@ -629,7 +633,7 @@ class SiteAuditor:
         self.log(f"CSV search report saved to: {filename}")
 
     def generate_images_csv_report(self, filename: str):
-        """Generate a CSV report with one row per image missing alt/title."""
+        """Generate a CSV report with one row per image with a missing attribute."""
         with open(filename, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Page URL", "Image URL", "Missing", "Alt", "Title"])
@@ -896,14 +900,22 @@ class SiteAuditor:
         self.log(f"HTML search report saved to: {filename}")
 
     def generate_images_html_report(self, filename: str):
-        """Generate an HTML report of images missing alt/title, grouped by image."""
+        """Generate an HTML report of images with missing attributes, grouped by image."""
         safe_base_url = escape(self.base_url)
         groups = self._group_image_issues()
         pages_with_issues = len({r.page_url for r in self.report.image_issues})
+        missing_stats = "".join(
+            f"""            <div class="stat">
+                <div class="stat-number broken">{self._count_missing(attr)}</div>
+                <div class="stat-label">Missing {attr.capitalize()}</div>
+            </div>
+"""
+            for attr in self.image_attrs
+        )
         html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Image Alt/Title Report - {safe_base_url}</title>
+    <title>Image {self.image_label.title()} Report - {safe_base_url}</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }}
         .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
@@ -926,7 +938,7 @@ class SiteAuditor:
 </head>
 <body>
     <div class="container">
-        <h1>🖼️ Image Alt/Title Report</h1>
+        <h1>🖼️ Image {self.image_label.title()} Report</h1>
         <p><strong>URL:</strong> {safe_base_url}{" (sitemap only)" if self.sitemap_only else ""}<br>
         <strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 
@@ -939,15 +951,7 @@ class SiteAuditor:
                 <div class="stat-number">{self.report.images_checked}</div>
                 <div class="stat-label">Images Checked</div>
             </div>
-            <div class="stat">
-                <div class="stat-number broken">{self._count_missing("alt")}</div>
-                <div class="stat-label">Missing Alt</div>
-            </div>
-            <div class="stat">
-                <div class="stat-number broken">{self._count_missing("title")}</div>
-                <div class="stat-label">Missing Title</div>
-            </div>
-            <div class="stat">
+{missing_stats}            <div class="stat">
                 <div class="stat-number">{pages_with_issues}</div>
                 <div class="stat-label">Pages With Issues</div>
             </div>
@@ -959,8 +963,8 @@ class SiteAuditor:
 """
 
         if groups:
-            html += """
-        <h2>Images Missing Alt/Title</h2>
+            html += f"""
+        <h2>Images Missing {self.image_label.title()}</h2>
         <p>Each image is listed once, with the pages where it appears. The CSV has one row per page.</p>
         <table>
             <tr><th>Preview</th><th>Image URL</th><th>Missing</th><th>Found On</th></tr>
@@ -983,7 +987,7 @@ class SiteAuditor:
 """
             html += "        </table>\n"
         else:
-            html += "        <p>No images missing alt or title. 🎉</p>\n"
+            html += f"        <p>No images missing {self.image_label}. 🎉</p>\n"
 
         html += """
     </div>
@@ -1071,23 +1075,23 @@ class SiteAuditor:
 
 
     def print_images_summary(self):
-        """Print an image alt/title summary to console."""
+        """Print an image attribute summary to console."""
         groups = self._group_image_issues()
 
         print("\n" + "=" * 60)
-        print("IMAGE ALT/TITLE SUMMARY")
+        print(f"IMAGE {self.image_label.upper()} SUMMARY")
         print("=" * 60)
         print(f"Base URL:        {self.base_url}")
         print(f"Pages crawled:   {self.report.total_pages_crawled}")
         print(f"Images checked:  {self.report.images_checked}")
-        print(f"Missing alt:     {self._count_missing('alt')}")
-        print(f"Missing title:   {self._count_missing('title')}")
+        for attr in self.image_attrs:
+            print(f"{'Missing ' + attr + ':':<17}{self._count_missing(attr)}")
         print(f"Unique images:   {len(groups)}")
         print(f"URLs skipped:    {len(self.report.skipped_urls)}")
         print("=" * 60)
 
         if groups:
-            print("\nIMAGES MISSING ALT/TITLE:")
+            print(f"\nIMAGES MISSING {self.image_label.upper()}:")
             for image_url, missing, pages in groups[:20]:
                 print(f"  [{missing}] {image_url}")
                 print(f"       On {len(pages)} page(s), e.g. {pages[0]}")
@@ -1131,6 +1135,17 @@ def main():
         action="store_true",
         help="Report <img> elements missing alt or title instead of validating links",
     )
+    image_attr = parser.add_mutually_exclusive_group()
+    image_attr.add_argument(
+        "--alt-only",
+        action="store_true",
+        help="Image mode, checking only the alt attribute (implies --check-images)",
+    )
+    image_attr.add_argument(
+        "--title-only",
+        action="store_true",
+        help="Image mode, checking only the title attribute (implies --check-images)",
+    )
     parser.add_argument(
         "--sitemap-only",
         action="store_true",
@@ -1158,6 +1173,17 @@ def main():
 
     args = parser.parse_args()
 
+    if args.alt_only or args.title_only:
+        if args.search_term:
+            parser.error("--alt-only/--title-only cannot be combined with --search-term")
+        args.check_images = True
+    if args.alt_only:
+        image_attrs = ("alt",)
+    elif args.title_only:
+        image_attrs = ("title",)
+    else:
+        image_attrs = ("alt", "title")
+
     # Ensure URL has scheme
     url = args.url
     if not url.startswith(("http://", "https://")):
@@ -1178,6 +1204,7 @@ def main():
         search_term=args.search_term or "",
         skip_patterns=skip_patterns,
         check_images=args.check_images,
+        image_attrs=image_attrs,
         sitemap_only=args.sitemap_only,
     )
 
