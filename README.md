@@ -3,7 +3,10 @@
 Crawl a website with a real (headless) browser and get an HTML/CSV report of either:
 
 - **Broken links** — 4xx/5xx, redirects and connection errors (default mode), or
-- **Where a word or phrase appears** — e.g. every page that mentions `"Royal Motors"` (`--search-term`).
+- **Where a word or phrase appears** — e.g. every page that mentions `"Royal Motors"` (`--search-term`), or
+- **Images missing `alt` and/or `title`** (`--check-images`, or `--alt-only` / `--title-only`).
+
+Any mode can be limited to the pages listed on the site's sitemap page (`--sitemap-only`).
 
 Because it uses Playwright + Chromium, it sees links and text rendered by JavaScript that plain HTTP scrapers miss.
 
@@ -67,6 +70,10 @@ playwright install chromium
 | …and external links too | `python site_auditor.py https://example.com --check-external -o reports/example` |
 | Find every page mentioning a word | `python site_auditor.py https://example.com --search-term GMC -o reports/gmc` |
 | Find a multi-word phrase | `python site_auditor.py https://example.com --search-term "Royal Motors" -o reports/royal` |
+| Find images without alt/title | `python site_auditor.py https://example.com --check-images -o reports/images` |
+| …only missing alt | `python site_auditor.py https://example.com --alt-only -o reports/alt` |
+| …only missing title | `python site_auditor.py https://example.com --title-only -o reports/title` |
+| …only on sitemap pages, without inventory | `python site_auditor.py https://example.com/sitemap.htm --sitemap-only --skip-inventory --check-images -o reports/images` |
 | Test quickly on a few pages | add `--max-pages 20` |
 | Ignore dealer inventory / blog pages | add `--skip-inventory --skip-blogs` |
 | Ignore any other section | add `--exclude "/events/"` (repeatable) |
@@ -109,6 +116,42 @@ Notes:
 - Header/footer content is repeated on every page, so a term in the nav produces one match per page crawled.
 - Links that point to skipped URLs (see below) are still searched on the pages where they appear; the skipped pages themselves are not opened.
 
+### 3. Image alt/title audit (`--check-images`)
+
+Crawls the same way but **does not check links**. Instead it reports every `<img>` on each page whose `alt` or `title` attribute is missing or empty.
+
+| Flag | Checks |
+|---|---|
+| `--check-images` | both `alt` and `title` (an image is reported if either is missing) |
+| `--alt-only` | only `alt` |
+| `--title-only` | only `title` |
+
+`--alt-only` and `--title-only` turn on image mode by themselves (no need to also pass `--check-images`) and can't be used together.
+
+- **Missing** column values: `alt`, `title`, `alt (empty)`, `title (empty)`, or combinations like `alt, title` (only the attributes being checked).
+- `alt=""` is reported as `alt (empty)`. It is valid for purely decorative images, so review those before fixing.
+- 1×1 tracking pixels are ignored. Lazy-loaded images are covered when the URL is in `src` or `data-src`.
+- Only `<img>` tags are checked — not CSS background images or inline `<svg>`. Images the site only adds after scrolling may be missed.
+- Shared images (logo, header, footer) appear on every page. The HTML report lists each image **once** with the pages it appears on; the CSV has one row per page.
+- None of the image flags can be combined with `--search-term`.
+
+### Limiting to the sitemap (`--sitemap-only`)
+
+Pass the site's sitemap page as the URL and add `--sitemap-only`: the tool opens the sitemap, visits each internal page it links to, and **does not follow links any further**. Works with every mode.
+
+Dealer sitemaps also list hundreds of vehicle pages; add `--skip-inventory` to drop them and keep only the editorial pages:
+
+```bash
+python site_auditor.py https://osteensubaruofvaldostasoa.cms.dealer.com/sitemap.htm \
+  --sitemap-only --skip-inventory --check-images \
+  -o reports/osteen_images
+```
+
+- The sitemap page itself is also checked.
+- Inventory landing pages (e.g. `/new-inventory/index.htm`) are still visited; add `--exclude "inventory"` to drop those too.
+- It works with HTML sitemap pages (a page of links), not `sitemap.xml` files.
+- In audit mode, the links on each listed page are still checked; only the crawl stops at one level.
+
 ---
 
 ## Skipping pages
@@ -144,6 +187,10 @@ The starting URL is never skipped.
 | `-o`, `--output PATH` | `audit_report` | Report path **without extension**. The directory must already exist. |
 | `-f`, `--format` | `both` | `html`, `csv` or `both`. |
 | `--search-term TEXT` | — | Switch to content-search mode. Quote multi-word phrases. |
+| `--check-images` | off | Switch to image mode: report `<img>` elements missing `alt` or `title`. |
+| `--alt-only` | off | Image mode checking only `alt` (implies `--check-images`). |
+| `--title-only` | off | Image mode checking only `title` (implies `--check-images`). |
+| `--sitemap-only` | off | Only visit the start URL and the internal pages it links to (pass the sitemap page as `url`). |
 | `--skip-inventory` | off | Skip vehicle detail pages and faceted inventory searches. |
 | `--skip-blogs` | off | Skip `/blog/` pages. |
 | `--exclude REGEX` | — | Skip internal URLs matching REGEX (repeatable). |
@@ -190,6 +237,22 @@ Each run prints a summary to the console and writes `<output>.html` and/or `<out
 | Target URL | Link destination (link matches only). |
 | Type | `Internal`/`External` for the target link (always `Internal` for page-text matches). |
 
+### Image reports
+
+**HTML**: summary cards (pages crawled, images checked, missing alt and/or missing title, pages with issues, URLs skipped) and a table with one row per image: preview, URL, what's missing, and a collapsible list of pages where it appears. Most widespread images first.
+
+**CSV** — one row per image per page:
+
+| Column | Meaning |
+|---|---|
+| Page URL | Page where the image appears. |
+| Image URL | Absolute image URL (`[no src]` if none). |
+| Missing | `alt`, `title`, `alt (empty)`, `title (empty)` or a combination. |
+| Alt | Current `alt` value (blank if missing or empty). |
+| Title | Current `title` value (blank if missing or empty). |
+
+Counts in the summary (Missing Alt / Missing Title) are per image occurrence, so a logo without a title on 40 pages counts 40.
+
 ### Interrupting a run
 
 Press **Ctrl+C** at any time: the summary is printed and partial reports are saved as `<output>_partial.html` and `<output>_partial.csv` (always both formats, regardless of `-f`).
@@ -198,9 +261,10 @@ Press **Ctrl+C** at any time: the summary is printed and partial reports are sav
 
 ## How it works
 
-1. **Crawl** — Headless Chromium opens the starting URL, waits for the DOM plus ~1.5 s for JavaScript, and collects every `a[href]`. Internal links (same host) are queued breadth-first. `mailto:`, `tel:`, `javascript:`, `#anchors` and `data:` links are ignored; `#fragments` are stripped. If a page times out it retries once with a lighter wait strategy before recording a `TIMEOUT`.
+1. **Crawl** — Headless Chromium opens the starting URL, waits for the DOM plus ~1.5 s for JavaScript, and collects every `a[href]`. Internal links (same host) are queued breadth-first (with `--sitemap-only`, only the start page's links are queued). `mailto:`, `tel:`, `javascript:`, `#anchors` and `data:` links are ignored; `#fragments` are stripped. If a page times out it retries once with a lighter wait strategy before recording a `TIMEOUT`.
 2. **Check links** (audit mode) — new links from each page are checked in parallel (10 workers) with an HTTP `HEAD`, falling back to `GET` if the server answers 405 or refuses the connection. Redirects are followed and detected by comparing the final URL with the original.
 3. **Search** (search mode) — instead of step 2, the page's visible text and its links are scanned for the term.
+   **Images** (image mode) — instead of step 2, every `<img>` in the rendered page is checked for `alt` and `title`.
 4. **Report** — summary to console, then HTML/CSV files.
 
 ---
@@ -217,6 +281,7 @@ Press **Ctrl+C** at any time: the summary is printed and partial reports are sav
 | Run never ends on a big site | Use `--max-pages`, `--skip-inventory`, `--skip-blogs`, `--exclude`, and avoid `--check-external` (the slowest part). |
 | Many `TIMEOUT` errors | Slow server — raise `--timeout` (e.g. `90000`). |
 | Same page reported twice | A redirecting URL and its destination are crawled as separate pages (e.g. `/old` → `/new`). Also query-string variants (`?a=1`, `?a=2`) are different URLs. |
+| `--sitemap-only` visits just 1 page | The sitemap's links weren't found (check the `Found N links` line for the sitemap). Make sure the URL is the HTML sitemap page, and see the next row. |
 | `Found 0 links` on a page that clearly has links | The site renders navigation without real `<a href>` elements (buttons, click handlers) or inside iframes. The tool can't follow those; audit the target pages directly by passing their URLs as the starting `url`. |
 | Some links reported broken but work in a browser | Some servers block automated requests (403/429) or reject `HEAD`. Open the URL manually to confirm before fixing. |
 
