@@ -8,7 +8,7 @@ A command-line tool that crawls websites and generates detailed reports of broke
 - Discovers all internal pages via breadth-first traversal
 - Checks every link found on each page (internal and optionally external)
 - Detects broken links (4xx/5xx), redirects, and connection errors
-- Can search the crawled site for a word or phrase, such as `GMC`, instead of validating links
+- Can search the crawled site for a word or phrase (e.g., `"Royal Motors"`, `GMC`) instead of validating links
 - Generates reports in HTML and/or CSV format
 - Handles interruptions gracefully (Ctrl+C saves a partial report)
 
@@ -90,10 +90,28 @@ python site_auditor.py https://example.com --check-external
 ### Search a site for a word or phrase instead of checking broken links
 
 ```bash
+# Single word
 python site_auditor.py https://example.com --search-term GMC -o reports/gmc_search -f both
+
+# Multi-word phrase (use quotes)
+python site_auditor.py https://example.com --search-term "Royal Motors" -o reports/royal_motors_search -f both
 ```
 
-Search mode still crawls internal pages from the provided site, but it skips HTTP link validation. The report lists page-text matches and link matches whose text or URL contains the search term.
+Search mode still crawls internal pages from the provided site, but it skips HTTP link validation. The report lists page-text matches and link matches whose text or URL contains the search term. Matches are case-insensitive.
+
+### Skip template-generated pages (inventory, blogs)
+
+Dealer sites generate thousands of near-identical inventory pages (e.g. `/new/Chevrolet/2026-Chevrolet-Suburban-...-b7e0d228ac180c97dc3ffb0cc9687c37.htm`) that can consume the whole `--max-pages` budget before editorial pages are reached. Skip them with:
+
+```bash
+python site_auditor.py https://example.com --search-term "No Hassle Pricing" --skip-inventory --skip-blogs -o reports/example_search
+```
+
+- `--skip-inventory` skips vehicle detail pages (`/new|used|certified/...-<32 hex id>.htm`) and faceted inventory searches (`/*inventory/...?...`). The inventory landing pages themselves (e.g. `/new-inventory/index.htm`) are still crawled.
+- `--skip-blogs` skips everything under `/blog/`.
+- `--exclude REGEX` (repeatable) skips any other internal URL whose path+query matches the regex, e.g. `--exclude "/events/"`.
+
+Skipped URLs are neither crawled nor link-checked; their count appears in the summary and reports as **URLs Skipped**.
 
 ### Limit the number of pages crawled
 
@@ -129,10 +147,19 @@ python site_auditor.py https://example.com --check-external --max-pages 200 --ti
 | `--timeout` | `60000` | Page load timeout in milliseconds |
 | `-o`, `--output` | `audit_report` | Output filename (without extension) |
 | `-f`, `--format` | `both` | Output format: `html`, `csv`, or `both` |
-| `--search-term` | *(not set)* | Search crawled page text and discovered links for a word/phrase instead of validating links |
+| `--search-term` | *(not set)* | Search crawled page text and discovered links for a word/phrase instead of validating links (use quotes for multi-word phrases) |
+| `--skip-inventory` | off | Skip template-generated inventory pages (vehicle detail pages and faceted searches) |
+| `--skip-blogs` | off | Skip blog pages (anything under `/blog/`) |
+| `--exclude` | *(not set)* | Skip internal URLs whose path+query matches this regex (repeatable) |
 | `-q`, `--quiet` | off | Suppress verbose per-page output |
 
 ## Output
+
+Reports are written to the current directory unless a path is specified with `-o`. Make sure the target directory exists before running:
+
+```bash
+mkdir -p reports
+```
 
 ### Broken-Link HTML Report
 
@@ -189,7 +216,7 @@ When `--search-term` is provided, the HTML and CSV reports switch to search find
 crawl/
 ├── site_auditor.py    # Main script (single file, no external config)
 ├── README.md
-└── <output dirs>/     # Generated reports (created per audit run)
+└── reports/           # Generated reports (create before running)
     ├── my_report.html
     └── my_report.csv
 ```
@@ -200,3 +227,22 @@ crawl/
 - **Timeouts**: If pages are slow to load, increase `--timeout` (value is in milliseconds).
 - **Interruptions**: Press Ctrl+C at any time. The tool will save whatever it has collected so far as a partial report.
 - **Output directories**: Create the output directory before running if using a path (e.g., `mkdir -p reports` before `-o reports/my_report`).
+
+## Troubleshooting
+
+### Sitemaps and JS-heavy pages return 0 links
+
+Some sites render their navigation and sitemap links through JavaScript frameworks (e.g., dealer.com, React SPAs) in ways Playwright's DOM query (`a[href]`) cannot detect. If the tool reports `Found 0 links` on a page that clearly has links, the site is likely using a non-standard rendering approach.
+
+**Workaround**: Extract the page source manually and use the links directly:
+
+```bash
+# Fetch the page and extract links with Python's html.parser
+# Then search each link with curl or feed them as separate--search-term runs.
+```
+
+### Increasing crawl reliability
+
+- Increase `--timeout` for slow servers (e.g., `--timeout 90000`)
+- Use `--max-pages` to limit scope on massive sites
+- Avoid `--check-external` on large sites unless necessary -- external link checking is the slowest phase

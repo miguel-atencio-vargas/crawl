@@ -7,6 +7,7 @@ Usage:
     python site_auditor.py https://example.com
     python site_auditor.py https://example.com --max-pages 100 --check-external
     python site_auditor.py https://example.com --search-term GMC
+    python site_auditor.py https://example.com --skip-inventory --skip-blogs
 """
 
 import argparse
@@ -28,6 +29,19 @@ try:
 except ModuleNotFoundError:
     sync_playwright = None
     PlaywrightTimeout = TimeoutError
+
+
+# Template-generated pages multiply into thousands of near-identical URLs and
+# exhaust --max-pages before editorial pages are reached.
+URL_SKIP_PRESETS = {
+    "inventory": [
+        # Vehicle detail pages: /new/Chevrolet/2026-...-<32 hex id>.htm
+        r"/(new|used|certified)/.+-[0-9a-f]{32}\.htm",
+        # Faceted inventory searches: /new-inventory/index.htm?model=...
+        r"/[\w-]*inventory/[^?]*\?",
+    ],
+    "blogs": [r"/blog/"],
+}
 
 
 @dataclass
@@ -62,6 +76,7 @@ class AuditReport:
     errors: list = field(default_factory=list)
     search_term: str = ""
     search_matches: list = field(default_factory=list)
+    skipped_urls: set = field(default_factory=set)
 
 
 class SiteAuditor:
@@ -74,6 +89,7 @@ class SiteAuditor:
         verbose: bool = True,
         max_retries: int = 2,
         search_term: str = "",
+        skip_patterns: list[str] | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.base_domain = urlparse(base_url).netloc
@@ -89,6 +105,8 @@ class SiteAuditor:
             else None
         )
 
+        self.skip_patterns = [re.compile(p, re.IGNORECASE) for p in (skip_patterns or [])]
+
         self.visited_urls: set = set()
         self.checked_links: set = set()
         self.to_crawl: deque = deque()
@@ -103,6 +121,14 @@ class SiteAuditor:
         """Check if URL belongs to the same domain."""
         parsed = urlparse(url)
         return parsed.netloc == self.base_domain or parsed.netloc == ""
+
+    def should_skip(self, url: str) -> bool:
+        """Check if URL matches a configured skip pattern."""
+        if url.rstrip("/") == self.base_url:
+            return False
+        parsed = urlparse(url)
+        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+        return any(p.search(target) for p in self.skip_patterns)
 
     def normalize_url(self, url: str, current_page: str) -> str | None:
         """Normalize and validate a URL."""
@@ -331,6 +357,8 @@ class SiteAuditor:
         self.log(f"Starting {mode_label} of {self.base_url}")
         pages_label = "unlimited" if self.max_pages == 0 else str(self.max_pages)
         self.log(f"Max pages: {pages_label}, Check external: {self.check_external}")
+        if self.skip_patterns:
+            self.log(f"Skip patterns: {', '.join(p.pattern for p in self.skip_patterns)}")
         self.log("-" * 60)
 
         with sync_playwright() as p:
@@ -376,6 +404,10 @@ class SiteAuditor:
                             continue
 
                         is_external = not self.is_internal_url(normalized)
+
+                        if not is_external and self.should_skip(normalized):
+                            self.report.skipped_urls.add(normalized)
+                            continue
 
                         # Add internal links to crawl queue
                         if not is_external and normalized not in self.visited_urls:
@@ -572,6 +604,10 @@ class SiteAuditor:
                 <div class="stat-number">{len(self.report.errors)}</div>
                 <div class="stat-label">Errors</div>
             </div>
+            <div class="stat">
+                <div class="stat-number">{len(self.report.skipped_urls)}</div>
+                <div class="stat-label">URLs Skipped</div>
+            </div>
         </div>
 """
 
@@ -693,6 +729,10 @@ class SiteAuditor:
                 <div class="stat-number">{len([m for m in self.report.search_matches if m.match_type == 'Link'])}</div>
                 <div class="stat-label">Link Matches</div>
             </div>
+            <div class="stat">
+                <div class="stat-number">{len(self.report.skipped_urls)}</div>
+                <div class="stat-label">URLs Skipped</div>
+            </div>
         </div>
 """
 
@@ -747,6 +787,7 @@ class SiteAuditor:
         print(f"Broken links:    {len(self.report.broken_links)}")
         print(f"Redirects:       {len(self.report.redirects)}")
         print(f"Errors:          {len(self.report.errors)}")
+        print(f"URLs skipped:    {len(self.report.skipped_urls)}")
         print("=" * 60)
 
         if self.report.broken_links:
@@ -788,6 +829,7 @@ class SiteAuditor:
         print(f"Matches found:   {len(self.report.search_matches)}")
         print(f"Page text:       {len(text_matches)}")
         print(f"Links:           {len(link_matches)}")
+        print(f"URLs skipped:    {len(self.report.skipped_urls)}")
         print("=" * 60)
 
         if self.report.search_matches:
@@ -831,6 +873,21 @@ def main():
             "of validating links, e.g. --search-term GMC"
         ),
     )
+    parser.add_argument(
+        "--skip-inventory",
+        action="store_true",
+        help="Skip template-generated inventory pages (vehicle detail pages and faceted searches)",
+    )
+    parser.add_argument(
+        "--skip-blogs", action="store_true", help="Skip blog pages (anything under /blog/)"
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Skip internal URLs whose path+query matches this regex (repeatable)",
+    )
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress verbose output")
 
     args = parser.parse_args()
@@ -840,6 +897,12 @@ def main():
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
+    skip_patterns = list(args.exclude)
+    if args.skip_inventory:
+        skip_patterns += URL_SKIP_PRESETS["inventory"]
+    if args.skip_blogs:
+        skip_patterns += URL_SKIP_PRESETS["blogs"]
+
     auditor = SiteAuditor(
         base_url=url,
         max_pages=args.max_pages,
@@ -847,6 +910,7 @@ def main():
         timeout=args.timeout,
         verbose=not args.quiet,
         search_term=args.search_term or "",
+        skip_patterns=skip_patterns,
     )
 
     try:
