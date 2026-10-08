@@ -8,6 +8,7 @@ Usage:
     python site_auditor.py https://example.com --max-pages 100 --check-external
     python site_auditor.py https://example.com --search-term GMC
     python site_auditor.py https://example.com --skip-inventory --skip-blogs
+    python site_auditor.py https://example.com/sitemap.htm --sitemap-only --check-images --skip-inventory
 """
 
 import argparse
@@ -66,6 +67,15 @@ class SearchResult:
 
 
 @dataclass
+class ImageResult:
+    page_url: str
+    image_url: str
+    missing: str
+    alt: str | None
+    title: str | None
+
+
+@dataclass
 class AuditReport:
     base_url: str
     total_pages_crawled: int = 0
@@ -77,6 +87,8 @@ class AuditReport:
     search_term: str = ""
     search_matches: list = field(default_factory=list)
     skipped_urls: set = field(default_factory=set)
+    images_checked: int = 0
+    image_issues: list = field(default_factory=list)
 
 
 class SiteAuditor:
@@ -90,6 +102,8 @@ class SiteAuditor:
         max_retries: int = 2,
         search_term: str = "",
         skip_patterns: list[str] | None = None,
+        check_images: bool = False,
+        sitemap_only: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.base_domain = urlparse(base_url).netloc
@@ -106,6 +120,11 @@ class SiteAuditor:
         )
 
         self.skip_patterns = [re.compile(p, re.IGNORECASE) for p in (skip_patterns or [])]
+        self.check_images = check_images
+        self.sitemap_only = sitemap_only
+        # Search and image modes answer a different question, so they skip
+        # HTTP link validation.
+        self.validate_links = not (self.search_term or self.check_images)
 
         self.visited_urls: set = set()
         self.checked_links: set = set()
@@ -235,6 +254,61 @@ class SiteAuditor:
         if page_matches:
             self.log(f"  Found {len(page_matches)} page-text matches for '{self.search_term}'")
 
+    def collect_image_issues(self, page, current_url: str):
+        """Record <img> elements whose alt or title attribute is missing or empty."""
+        if not self.check_images:
+            return
+
+        try:
+            images = page.evaluate(
+                """() => Array.from(document.images).map(img => ({
+                    src: img.currentSrc || img.getAttribute('src') || img.getAttribute('data-src') || '',
+                    alt: img.getAttribute('alt'),
+                    title: img.getAttribute('title'),
+                    // 1x1 tracking pixels are not content images
+                    pixel: (img.complete && img.naturalWidth === 1 && img.naturalHeight === 1)
+                        || (img.getAttribute('width') === '1' && img.getAttribute('height') === '1'),
+                }))"""
+            )
+        except Exception as e:
+            self.log(f"  Error extracting images: {e}")
+            return
+
+        issues = 0
+        for img in images:
+            if img["pixel"]:
+                continue
+            self.report.images_checked += 1
+
+            missing = []
+            for attr in ("alt", "title"):
+                value = img[attr]
+                if value is None:
+                    missing.append(attr)
+                elif not value.strip():
+                    missing.append(f"{attr} (empty)")
+            if not missing:
+                continue
+
+            src = img["src"]
+            if src.startswith("data:"):
+                image_url = src[:60] + "…"  # inline images can be huge
+            else:
+                image_url = urljoin(current_url, src) if src else ""
+            self.report.image_issues.append(
+                ImageResult(
+                    page_url=current_url,
+                    image_url=image_url or "[no src]",
+                    missing=", ".join(missing),
+                    alt=img["alt"],
+                    title=img["title"],
+                )
+            )
+            issues += 1
+
+        if issues:
+            self.log(f"  Found {issues} images missing alt/title")
+
     def check_link(self, url: str, source_page: str, link_text: str) -> LinkResult:
         """Check if a link is working using requests library. Detects redirects by comparing final URL."""
         is_external = not self.is_internal_url(url)
@@ -349,12 +423,15 @@ class SiteAuditor:
                 "`pip install playwright requests` and then run `playwright install chromium`."
             )
 
-        mode_label = (
-            f"content search for '{self.search_term}'"
-            if self.search_term
-            else "broken-link audit"
-        )
+        if self.search_term:
+            mode_label = f"content search for '{self.search_term}'"
+        elif self.check_images:
+            mode_label = "image alt/title audit"
+        else:
+            mode_label = "broken-link audit"
         self.log(f"Starting {mode_label} of {self.base_url}")
+        if self.sitemap_only:
+            self.log("Sitemap only: visiting pages linked from the start URL, not following further")
         pages_label = "unlimited" if self.max_pages == 0 else str(self.max_pages)
         self.log(f"Max pages: {pages_label}, Check external: {self.check_external}")
         if self.skip_patterns:
@@ -368,11 +445,11 @@ class SiteAuditor:
             )
             page = context.new_page()
 
-            # Start with base URL
-            self.to_crawl.append(self.base_url)
+            # Start with base URL (depth 0)
+            self.to_crawl.append((self.base_url, 0))
 
             while self.to_crawl and (self.max_pages == 0 or self.report.total_pages_crawled < self.max_pages):
-                current_url = self.to_crawl.popleft()
+                current_url, depth = self.to_crawl.popleft()
 
                 if current_url in self.visited_urls:
                     continue
@@ -396,6 +473,12 @@ class SiteAuditor:
                     self.log(f"  Found {len(links)} links")
 
                     self.collect_search_matches(page, current_url, links)
+                    self.collect_image_issues(page, current_url)
+
+                    # With --sitemap-only, only the start page's links are followed.
+                    follow_links = not self.sitemap_only or depth == 0
+                    if not follow_links and not self.validate_links:
+                        continue
 
                     to_check = []
                     for href, link_text in links:
@@ -410,13 +493,13 @@ class SiteAuditor:
                             continue
 
                         # Add internal links to crawl queue
-                        if not is_external and normalized not in self.visited_urls:
-                            self.to_crawl.append(normalized)
+                        if follow_links and not is_external and normalized not in self.visited_urls:
+                            self.to_crawl.append((normalized, depth + 1))
 
-                        # Queue link for batch checking. In search mode, crawling still
-                        # follows internal links, but link validation is intentionally
-                        # skipped so the run answers "where does this term appear?"
-                        if not self.search_term and normalized not in self.checked_links:
+                        # Queue link for batch checking. In search and image modes,
+                        # crawling still follows internal links, but link validation
+                        # is intentionally skipped.
+                        if self.validate_links and normalized not in self.checked_links:
                             if not is_external or self.check_external:
                                 self.checked_links.add(normalized)
                                 to_check.append((normalized, current_url, link_text))
@@ -459,6 +542,9 @@ class SiteAuditor:
         """Generate a CSV report of all findings."""
         if self.search_term:
             self.generate_search_csv_report(filename)
+            return
+        if self.check_images:
+            self.generate_images_csv_report(filename)
             return
 
         with open(filename, "w", newline="", encoding="utf-8") as f:
@@ -542,10 +628,47 @@ class SiteAuditor:
 
         self.log(f"CSV search report saved to: {filename}")
 
+    def generate_images_csv_report(self, filename: str):
+        """Generate a CSV report with one row per image missing alt/title."""
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Page URL", "Image URL", "Missing", "Alt", "Title"])
+            for result in self.report.image_issues:
+                writer.writerow([
+                    result.page_url,
+                    result.image_url,
+                    result.missing,
+                    "" if result.alt is None else result.alt,
+                    "" if result.title is None else result.title,
+                ])
+
+        self.log(f"CSV image report saved to: {filename}")
+
+    def _group_image_issues(self) -> list[tuple[str, str, list[str]]]:
+        """Group image issues by (image URL, missing) -> pages, most widespread first."""
+        groups: dict[tuple[str, str], list[str]] = {}
+        for result in self.report.image_issues:
+            pages = groups.setdefault((result.image_url, result.missing), [])
+            if result.page_url not in pages:
+                pages.append(result.page_url)
+        return sorted(
+            ((image_url, missing, pages) for (image_url, missing), pages in groups.items()),
+            key=lambda g: -len(g[2]),
+        )
+
+    def _count_missing(self, attr: str) -> int:
+        return sum(
+            1 for r in self.report.image_issues
+            if any(part.startswith(attr) for part in r.missing.split(", "))
+        )
+
     def generate_html_report(self, filename: str):
         """Generate an HTML report."""
         if self.search_term:
             self.generate_search_html_report(filename)
+            return
+        if self.check_images:
+            self.generate_images_html_report(filename)
             return
 
         html = f"""<!DOCTYPE html>
@@ -772,10 +895,114 @@ class SiteAuditor:
 
         self.log(f"HTML search report saved to: {filename}")
 
+    def generate_images_html_report(self, filename: str):
+        """Generate an HTML report of images missing alt/title, grouped by image."""
+        safe_base_url = escape(self.base_url)
+        groups = self._group_image_issues()
+        pages_with_issues = len({r.page_url for r in self.report.image_issues})
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <title>Image Alt/Title Report - {safe_base_url}</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }}
+        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; }}
+        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .stat {{ background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }}
+        .stat-number {{ font-size: 2em; font-weight: bold; }}
+        .stat-label {{ color: #666; margin-top: 5px; }}
+        .broken {{ color: #dc3545; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 15px; }}
+        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; vertical-align: top; }}
+        th {{ background: #f8f9fa; font-weight: 600; }}
+        tr:hover {{ background: #f8f9fa; }}
+        .url {{ max-width: 380px; word-break: break-all; }}
+        .thumb {{ max-width: 120px; max-height: 80px; background: #eee; }}
+        .badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; background: #f8d7da; color: #721c24; font-size: 0.85em; white-space: nowrap; }}
+        details ul {{ margin: 6px 0 0; padding-left: 18px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🖼️ Image Alt/Title Report</h1>
+        <p><strong>URL:</strong> {safe_base_url}{" (sitemap only)" if self.sitemap_only else ""}<br>
+        <strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+        <div class="summary">
+            <div class="stat">
+                <div class="stat-number">{self.report.total_pages_crawled}</div>
+                <div class="stat-label">Pages Crawled</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">{self.report.images_checked}</div>
+                <div class="stat-label">Images Checked</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number broken">{self._count_missing("alt")}</div>
+                <div class="stat-label">Missing Alt</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number broken">{self._count_missing("title")}</div>
+                <div class="stat-label">Missing Title</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">{pages_with_issues}</div>
+                <div class="stat-label">Pages With Issues</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">{len(self.report.skipped_urls)}</div>
+                <div class="stat-label">URLs Skipped</div>
+            </div>
+        </div>
+"""
+
+        if groups:
+            html += """
+        <h2>Images Missing Alt/Title</h2>
+        <p>Each image is listed once, with the pages where it appears. The CSV has one row per page.</p>
+        <table>
+            <tr><th>Preview</th><th>Image URL</th><th>Missing</th><th>Found On</th></tr>
+"""
+            for image_url, missing, pages in groups:
+                safe_image = escape(image_url)
+                preview = (
+                    f'<img class="thumb" src="{safe_image}" loading="lazy" alt="">'
+                    if image_url.startswith(("http://", "https://"))
+                    else ""
+                )
+                page_items = "".join(f"<li>{escape(p)}</li>" for p in pages)
+                label = "1 page" if len(pages) == 1 else f"{len(pages)} pages"
+                html += f"""            <tr>
+                <td>{preview}</td>
+                <td class="url">{safe_image}</td>
+                <td><span class="badge">{escape(missing)}</span></td>
+                <td class="url"><details><summary>{label}</summary><ul>{page_items}</ul></details></td>
+            </tr>
+"""
+            html += "        </table>\n"
+        else:
+            html += "        <p>No images missing alt or title. 🎉</p>\n"
+
+        html += """
+    </div>
+</body>
+</html>
+"""
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        self.log(f"HTML image report saved to: {filename}")
+
     def print_summary(self):
         """Print a summary to console."""
         if self.search_term:
             self.print_search_summary()
+            return
+        if self.check_images:
+            self.print_images_summary()
             return
 
         print("\n" + "=" * 60)
@@ -843,11 +1070,36 @@ class SiteAuditor:
                 print(f"  ... and {len(self.report.search_matches) - 20} more")
 
 
+    def print_images_summary(self):
+        """Print an image alt/title summary to console."""
+        groups = self._group_image_issues()
+
+        print("\n" + "=" * 60)
+        print("IMAGE ALT/TITLE SUMMARY")
+        print("=" * 60)
+        print(f"Base URL:        {self.base_url}")
+        print(f"Pages crawled:   {self.report.total_pages_crawled}")
+        print(f"Images checked:  {self.report.images_checked}")
+        print(f"Missing alt:     {self._count_missing('alt')}")
+        print(f"Missing title:   {self._count_missing('title')}")
+        print(f"Unique images:   {len(groups)}")
+        print(f"URLs skipped:    {len(self.report.skipped_urls)}")
+        print("=" * 60)
+
+        if groups:
+            print("\nIMAGES MISSING ALT/TITLE:")
+            for image_url, missing, pages in groups[:20]:
+                print(f"  [{missing}] {image_url}")
+                print(f"       On {len(pages)} page(s), e.g. {pages[0]}")
+            if len(groups) > 20:
+                print(f"  ... and {len(groups) - 20} more")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Crawl a website and check for broken links, or search crawled pages "
-            "for a word/phrase (handles JavaScript sites)"
+            "Crawl a website and check for broken links, search crawled pages "
+            "for a word/phrase, or find images missing alt/title (handles JavaScript sites)"
         )
     )
     parser.add_argument("url", help="The URL to audit")
@@ -866,11 +1118,25 @@ def main():
     parser.add_argument(
         "--format", "-f", choices=["html", "csv", "both"], default="both", help="Output format"
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--search-term",
         help=(
             "Search crawled pages and discovered links for this word/phrase instead "
             "of validating links, e.g. --search-term GMC"
+        ),
+    )
+    mode.add_argument(
+        "--check-images",
+        action="store_true",
+        help="Report <img> elements missing alt or title instead of validating links",
+    )
+    parser.add_argument(
+        "--sitemap-only",
+        action="store_true",
+        help=(
+            "Only visit the start URL and the internal pages it links to (e.g. pass "
+            "the site's /sitemap.htm); don't follow links any further"
         ),
     )
     parser.add_argument(
@@ -911,6 +1177,8 @@ def main():
         verbose=not args.quiet,
         search_term=args.search_term or "",
         skip_patterns=skip_patterns,
+        check_images=args.check_images,
+        sitemap_only=args.sitemap_only,
     )
 
     try:
