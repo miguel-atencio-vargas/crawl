@@ -1,248 +1,232 @@
 # Site Link Auditor
 
-A command-line tool that crawls websites and generates detailed reports of broken links, redirects, errors, or word/phrase matches found across a site. Uses Playwright for browser automation, so it handles JavaScript-rendered pages that simple HTTP scrapers would miss.
+Crawl a website with a real (headless) browser and get an HTML/CSV report of either:
 
-## What It Does
+- **Broken links** — 4xx/5xx, redirects and connection errors (default mode), or
+- **Where a word or phrase appears** — e.g. every page that mentions `"Royal Motors"` (`--search-term`).
 
-- Crawls an entire website using headless Chromium (via Playwright)
-- Discovers all internal pages via breadth-first traversal
-- Checks every link found on each page (internal and optionally external)
-- Detects broken links (4xx/5xx), redirects, and connection errors
-- Can search the crawled site for a word or phrase (e.g., `"Royal Motors"`, `GMC`) instead of validating links
-- Generates reports in HTML and/or CSV format
-- Handles interruptions gracefully (Ctrl+C saves a partial report)
+Because it uses Playwright + Chromium, it sees links and text rendered by JavaScript that plain HTTP scrapers miss.
 
-## Requirements
+---
 
-- [Miniconda](https://docs.anaconda.com/miniconda/install/) (or Anaconda)
-- Python 3.10+
-
-## Setup
-
-### 1. Install Miniconda
-
-If you don't have Miniconda installed, download it from https://docs.anaconda.com/miniconda/install/ and follow the instructions for your OS.
-
-### 2. Clone the repository
+## Quick start
 
 ```bash
-git clone <repo-url>
-cd crawl
-```
-
-### 3. Create the conda environment
-
-```bash
-conda create -n linkchecker python=3.11 -y
-```
-
-### 4. Activate the environment
-
-```bash
-conda activate linkchecker
-```
-
-You should see `(linkchecker)` at the beginning of your terminal prompt.
-
-### 5. Install Python dependencies
-
-```bash
-pip install playwright requests
-```
-
-### 6. Install browser binaries
-
-Playwright needs a Chromium binary to run the headless browser:
-
-```bash
-playwright install chromium
-```
-
-### Quick setup (copy-paste)
-
-```bash
+# one-time setup
 conda create -n linkchecker python=3.11 -y
 conda activate linkchecker
 pip install playwright requests
 playwright install chromium
-```
 
-## Usage
-
-Make sure the conda environment is active before running:
-
-```bash
+# every run
 conda activate linkchecker
+mkdir -p reports
+python site_auditor.py https://example.com -o reports/example
 ```
 
-### Basic audit (internal links only)
+Open `reports/example.html` in a browser (or `reports/example.csv` in a spreadsheet).
+
+---
+
+## Installation
+
+Requires **Python 3.10+**.
+
+### With conda (recommended)
+
+1. Install [Miniconda](https://docs.anaconda.com/miniconda/install/) if you don't have it.
+2. Clone and set up:
+
+   ```bash
+   git clone <repo-url>
+   cd crawl
+   conda create -n linkchecker python=3.11 -y
+   conda activate linkchecker          # prompt now shows (linkchecker)
+   pip install playwright requests
+   playwright install chromium         # downloads the headless browser
+   ```
+
+### With a plain virtualenv
 
 ```bash
-python site_auditor.py https://example.com
+python3 -m venv .venv
+source .venv/bin/activate              # Windows: .venv\Scripts\activate
+pip install playwright requests
+playwright install chromium
 ```
 
-### Audit with external link checking
+> Forgot `playwright install chromium`? You'll get `Executable doesn't exist at ...`. Run it inside the same environment.
+
+---
+
+## Cheat sheet
+
+| I want to… | Command |
+|---|---|
+| Find broken internal links | `python site_auditor.py https://example.com -o reports/example` |
+| …and external links too | `python site_auditor.py https://example.com --check-external -o reports/example` |
+| Find every page mentioning a word | `python site_auditor.py https://example.com --search-term GMC -o reports/gmc` |
+| Find a multi-word phrase | `python site_auditor.py https://example.com --search-term "Royal Motors" -o reports/royal` |
+| Test quickly on a few pages | add `--max-pages 20` |
+| Ignore dealer inventory / blog pages | add `--skip-inventory --skip-blogs` |
+| Ignore any other section | add `--exclude "/events/"` (repeatable) |
+| Only one report format | add `-f html` or `-f csv` |
+| Less console noise | add `-q` |
+| Slow site | add `--timeout 90000` |
+
+Full example:
 
 ```bash
-python site_auditor.py https://example.com --check-external
+python site_auditor.py https://example.com \
+  --check-external --skip-inventory --skip-blogs \
+  --max-pages 200 --timeout 90000 \
+  -o reports/example_audit -f both
 ```
 
-### Search a site for a word or phrase instead of checking broken links
+---
+
+## The two modes
+
+### 1. Broken-link audit (default)
+
+Crawls every internal page reachable from the starting URL and checks each link it finds.
+
+- Internal links are always checked; external links only with `--check-external`.
+- Each unique URL is checked once (first page where it was found is reported as *Found On*).
+- Results are classified as **broken** (4xx/5xx), **redirect** (final URL differs from the link), **error** (request failed / page timed out) or **working**.
+
+### 2. Content search (`--search-term`)
+
+Crawls the same way but **does not check links**. Instead it reports:
+
+- **Page Text** matches — the term appears in the page's visible text.
+- **Link** matches — the term appears in a link's text or URL (internal or external links).
+
+Notes:
+
+- Case-insensitive, literal match (no regex). `GMC` also matches `gmc` and `GMC's`, and substrings like `"GMC"` inside `"GMCertified"`.
+- Only **visible text** is searched — not meta tags, `alt`/`title` attributes, or the raw HTML source.
+- Header/footer content is repeated on every page, so a term in the nav produces one match per page crawled.
+- Links that point to skipped URLs (see below) are still searched on the pages where they appear; the skipped pages themselves are not opened.
+
+---
+
+## Skipping pages
+
+Large sites (dealer sites especially) generate thousands of near-identical pages that eat the whole `--max-pages` budget before the important pages are reached. Skipped URLs are neither crawled nor link-checked; their count is shown as **URLs Skipped**.
+
+| Flag | Skips | Still crawled |
+|---|---|---|
+| `--skip-inventory` | Vehicle detail pages: `/new\|used\|certified/...-<32 hex id>.htm`<br>Faceted searches: any `…inventory/…?query` (e.g. `/new-inventory/index.htm?model=Tahoe`) | Inventory landing pages without a query, e.g. `/new-inventory/index.htm` |
+| `--skip-blogs` | Anything with `/blog/` in the path | — |
+| `--exclude REGEX` | Internal URLs whose **path + query** match the regex (case-insensitive, matches anywhere) | — |
+
+`--exclude` examples:
 
 ```bash
-# Single word
-python site_auditor.py https://example.com --search-term GMC -o reports/gmc_search -f both
-
-# Multi-word phrase (use quotes)
-python site_auditor.py https://example.com --search-term "Royal Motors" -o reports/royal_motors_search -f both
+--exclude "/events/"                 # a section
+--exclude "\.pdf$"                   # a file type
+--exclude "^/es/" --exclude "^/fr/"  # several patterns (repeat the flag)
 ```
 
-Search mode still crawls internal pages from the provided site, but it skips HTTP link validation. The report lists page-text matches and link matches whose text or URL contains the search term. Matches are case-insensitive.
+The starting URL is never skipped.
 
-### Skip template-generated pages (inventory, blogs)
+---
 
-Dealer sites generate thousands of near-identical inventory pages (e.g. `/new/Chevrolet/2026-Chevrolet-Suburban-...-b7e0d228ac180c97dc3ffb0cc9687c37.htm`) that can consume the whole `--max-pages` budget before editorial pages are reached. Skip them with:
-
-```bash
-python site_auditor.py https://example.com --search-term "No Hassle Pricing" --skip-inventory --skip-blogs -o reports/example_search
-```
-
-- `--skip-inventory` skips vehicle detail pages (`/new|used|certified/...-<32 hex id>.htm`) and faceted inventory searches (`/*inventory/...?...`). The inventory landing pages themselves (e.g. `/new-inventory/index.htm`) are still crawled.
-- `--skip-blogs` skips everything under `/blog/`.
-- `--exclude REGEX` (repeatable) skips any other internal URL whose path+query matches the regex, e.g. `--exclude "/events/"`.
-
-Skipped URLs are neither crawled nor link-checked; their count appears in the summary and reports as **URLs Skipped**.
-
-### Limit the number of pages crawled
-
-```bash
-python site_auditor.py https://example.com --max-pages 50
-```
-
-### Custom output filename and format
-
-```bash
-python site_auditor.py https://example.com -o my_report -f both
-```
-
-### Quiet mode (suppress per-page logging)
-
-```bash
-python site_auditor.py https://example.com -q
-```
-
-### Full example
-
-```bash
-python site_auditor.py https://example.com --check-external --max-pages 200 --timeout 90000 -o reports/example_audit -f both
-```
-
-## Command-Line Options
+## Options
 
 | Option | Default | Description |
 |---|---|---|
-| `url` | *(required)* | The website URL to audit |
-| `--max-pages` | `0` (unlimited) | Maximum number of pages to crawl |
-| `--check-external` | off | Also validate external links |
-| `--timeout` | `60000` | Page load timeout in milliseconds |
-| `-o`, `--output` | `audit_report` | Output filename (without extension) |
-| `-f`, `--format` | `both` | Output format: `html`, `csv`, or `both` |
-| `--search-term` | *(not set)* | Search crawled page text and discovered links for a word/phrase instead of validating links (use quotes for multi-word phrases) |
-| `--skip-inventory` | off | Skip template-generated inventory pages (vehicle detail pages and faceted searches) |
-| `--skip-blogs` | off | Skip blog pages (anything under `/blog/`) |
-| `--exclude` | *(not set)* | Skip internal URLs whose path+query matches this regex (repeatable) |
-| `-q`, `--quiet` | off | Suppress verbose per-page output |
+| `url` | *(required)* | Starting URL. If you omit the scheme, `https://` is assumed. |
+| `--max-pages N` | `0` (unlimited) | Stop after crawling N pages (failed/404 pages count too). |
+| `--check-external` | off | Also check links to other domains (audit mode only). |
+| `--timeout MS` | `60000` | Page **load** timeout in milliseconds. Link checks use a fixed 15 s timeout. |
+| `-o`, `--output PATH` | `audit_report` | Report path **without extension**. The directory must already exist. |
+| `-f`, `--format` | `both` | `html`, `csv` or `both`. |
+| `--search-term TEXT` | — | Switch to content-search mode. Quote multi-word phrases. |
+| `--skip-inventory` | off | Skip vehicle detail pages and faceted inventory searches. |
+| `--skip-blogs` | off | Skip `/blog/` pages. |
+| `--exclude REGEX` | — | Skip internal URLs matching REGEX (repeatable). |
+| `-q`, `--quiet` | off | Hide per-page logging (the final summary is always printed). |
+| `-h`, `--help` | | Show help. |
+
+---
 
 ## Output
 
-Reports are written to the current directory unless a path is specified with `-o`. Make sure the target directory exists before running:
+Each run prints a summary to the console and writes `<output>.html` and/or `<output>.csv`.
 
-```bash
-mkdir -p reports
-```
+> ⚠️ Create the output directory first (`mkdir -p reports`). If it doesn't exist the script crashes **after** the crawl finishes and the results are lost.
 
-### Broken-Link HTML Report
+### Broken-link reports
 
-A styled, self-contained HTML page with:
+**HTML**: summary cards (pages crawled, links checked, broken, redirects, errors, URLs skipped) plus tables for broken links, errors and redirects. Working links are only in the CSV.
 
-- Summary statistics (pages crawled, links checked, broken count, redirects, errors)
-- Broken links table with status codes and source pages
-- Errors table with failure details
-- Redirects table showing original and destination URLs
+**CSV** — one row per checked link, ordered broken → errors → redirects → working:
 
-Open it in any browser to review.
-
-### CSV Report
-
-A spreadsheet-compatible CSV with columns:
-
-| Column | Description |
+| Column | Meaning |
 |---|---|
-| Status | HTTP status code or `ERROR`/`TIMEOUT` |
-| URL | The link that was checked |
-| Found On | The page where the link was discovered |
-| Link Text | The anchor text of the link |
-| Type | `Internal` or `External` |
-| Redirects To | Final URL if a redirect was detected |
-| Error | Error message if the request failed |
+| Status | HTTP status, or `ERROR` / `TIMEOUT`. For redirects this is the status of the **final** page (usually `200`), not the 301/302. |
+| URL | The link that was checked (or the page that failed to load). |
+| Found On | Page where the link was first found (empty for pages that failed to load). |
+| Link Text | Anchor text (first 50 chars, `[no text]` if empty). |
+| Type | `Internal` or `External`. |
+| Redirects To | Final URL, if it redirected. |
+| Error | Error message, if the request failed. |
 
-Rows are ordered: broken links first, then errors, redirects, and working links.
+### Search reports
 
-### Search Report
+**HTML**: summary cards (pages crawled, total matches, page-text matches, link matches, URLs skipped) and a matches table with the term highlighted.
 
-When `--search-term` is provided, the HTML and CSV reports switch to search findings with:
+**CSV** — one row per match:
 
-- Search term
-- Page URL where the match was found
-- Match type (`Page Text` or `Link`)
-- Matched text
-- Context snippet
-- Target URL for link matches
-- Internal/external classification for link matches
+| Column | Meaning |
+|---|---|
+| Search Term | The term as you typed it. |
+| Page URL | Page where the match was found. |
+| Match Type | `Page Text` or `Link`. |
+| Matched Text | The matched text with its original casing. |
+| Context | ~80 characters around a text match, or the link text/URL for link matches. |
+| Target URL | Link destination (link matches only). |
+| Type | `Internal`/`External` for the target link (always `Internal` for page-text matches). |
 
-## How It Works
+### Interrupting a run
 
-1. **Crawl phase** -- Playwright launches headless Chromium and loads each page, waiting for JavaScript to render. Links are extracted from the DOM (`a[href]` elements). Internal links are queued for further crawling in breadth-first order.
+Press **Ctrl+C** at any time: the summary is printed and partial reports are saved as `<output>_partial.html` and `<output>_partial.csv` (always both formats, regardless of `-f`).
 
-2. **Link checking phase** -- Each unique link is validated using HTTP HEAD requests (falling back to GET if HEAD returns 405 or fails). Links are checked in parallel using a thread pool (10 concurrent workers). A link is classified as broken if it returns a 4xx/5xx status, a redirect if the final URL differs from the original, or an error if the request fails entirely.
+---
 
-3. **Search phase** -- If `--search-term` is provided, link checking is skipped. The crawler searches visible page text plus discovered link text/URLs for case-insensitive matches.
+## How it works
 
-4. **Report generation** -- Results are written to HTML and/or CSV files. If the crawl is interrupted with Ctrl+C, partial reports are saved with a `_partial` suffix.
+1. **Crawl** — Headless Chromium opens the starting URL, waits for the DOM plus ~1.5 s for JavaScript, and collects every `a[href]`. Internal links (same host) are queued breadth-first. `mailto:`, `tel:`, `javascript:`, `#anchors` and `data:` links are ignored; `#fragments` are stripped. If a page times out it retries once with a lighter wait strategy before recording a `TIMEOUT`.
+2. **Check links** (audit mode) — new links from each page are checked in parallel (10 workers) with an HTTP `HEAD`, falling back to `GET` if the server answers 405 or refuses the connection. Redirects are followed and detected by comparing the final URL with the original.
+3. **Search** (search mode) — instead of step 2, the page's visible text and its links are scanned for the term.
+4. **Report** — summary to console, then HTML/CSV files.
 
-## Project Structure
+---
+
+## Troubleshooting & gotchas
+
+| Symptom | Cause / fix |
+|---|---|
+| Crawl stops after 1 page | The site redirects to another host (e.g. `example.com` → `www.example.com`) and absolute links are on that host, which counts as **external**. Start with the exact host the site uses: `https://www.example.com`. |
+| `ERR_SSL_PROTOCOL_ERROR` on the first page | You omitted the scheme on an HTTP-only site; `https://` was assumed. Pass `http://...` explicitly. |
+| `FileNotFoundError: ... .html` at the end | Output directory doesn't exist. `mkdir -p reports` before running. |
+| `Executable doesn't exist at ...` | Run `playwright install chromium` in the active environment. |
+| `Playwright is not installed` | Activate the environment (`conda activate linkchecker`) or `pip install playwright requests`. |
+| Run never ends on a big site | Use `--max-pages`, `--skip-inventory`, `--skip-blogs`, `--exclude`, and avoid `--check-external` (the slowest part). |
+| Many `TIMEOUT` errors | Slow server — raise `--timeout` (e.g. `90000`). |
+| Same page reported twice | A redirecting URL and its destination are crawled as separate pages (e.g. `/old` → `/new`). Also query-string variants (`?a=1`, `?a=2`) are different URLs. |
+| `Found 0 links` on a page that clearly has links | The site renders navigation without real `<a href>` elements (buttons, click handlers) or inside iframes. The tool can't follow those; audit the target pages directly by passing their URLs as the starting `url`. |
+| Some links reported broken but work in a browser | Some servers block automated requests (403/429) or reject `HEAD`. Open the URL manually to confirm before fixing. |
+
+---
+
+## Project structure
 
 ```
 crawl/
-├── site_auditor.py    # Main script (single file, no external config)
+├── site_auditor.py    # The whole tool (single file, no config)
 ├── README.md
-└── reports/           # Generated reports (create before running)
-    ├── my_report.html
-    └── my_report.csv
+└── reports/           # Your reports (create it; ignored by git)
 ```
-
-## Tips
-
-- **Large sites**: For sites with thousands of pages, use `--max-pages` to limit scope or run without `--check-external` to speed things up.
-- **Timeouts**: If pages are slow to load, increase `--timeout` (value is in milliseconds).
-- **Interruptions**: Press Ctrl+C at any time. The tool will save whatever it has collected so far as a partial report.
-- **Output directories**: Create the output directory before running if using a path (e.g., `mkdir -p reports` before `-o reports/my_report`).
-
-## Troubleshooting
-
-### Sitemaps and JS-heavy pages return 0 links
-
-Some sites render their navigation and sitemap links through JavaScript frameworks (e.g., dealer.com, React SPAs) in ways Playwright's DOM query (`a[href]`) cannot detect. If the tool reports `Found 0 links` on a page that clearly has links, the site is likely using a non-standard rendering approach.
-
-**Workaround**: Extract the page source manually and use the links directly:
-
-```bash
-# Fetch the page and extract links with Python's html.parser
-# Then search each link with curl or feed them as separate--search-term runs.
-```
-
-### Increasing crawl reliability
-
-- Increase `--timeout` for slow servers (e.g., `--timeout 90000`)
-- Use `--max-pages` to limit scope on massive sites
-- Avoid `--check-external` on large sites unless necessary -- external link checking is the slowest phase
