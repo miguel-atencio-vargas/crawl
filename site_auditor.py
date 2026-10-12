@@ -10,10 +10,12 @@ Usage:
     python site_auditor.py https://example.com --skip-inventory --skip-blogs
     python site_auditor.py https://example.com/sitemap.htm --sitemap-only --check-images --skip-inventory
     python site_auditor.py https://example.com --alt-only
+    python site_auditor.py https://example.com --list-links --skip-template-links
 """
 
 import argparse
 import csv
+import html as html_lib
 import re
 import sys
 import time
@@ -44,6 +46,20 @@ URL_SKIP_PRESETS = {
     ],
     "blogs": [r"/blog/"],
 }
+
+# Link-text words too generic to say anything about where a link should go.
+GENERIC_LINK_WORDS = {
+    "the", "and", "for", "our", "you", "your", "with", "from", "this", "that",
+    "now", "more", "view", "click", "here", "learn", "shop", "see", "all", "get",
+    "visit", "read", "find", "out", "today", "details", "info", "information", "page",
+}
+
+# Links in these landmarks are site template (repeated on every page).
+TEMPLATE_SECTIONS = {"header", "nav", "footer"}
+
+# A link (same URL + text) on at least this share of crawled pages is template too.
+TEMPLATE_REPEAT_RATIO = 0.8
+TEMPLATE_REPEAT_MIN_PAGES = 5
 
 
 @dataclass
@@ -77,6 +93,17 @@ class ImageResult:
 
 
 @dataclass
+class LinkEntry:
+    page_url: str
+    name: str
+    url: str
+    link_type: str  # Internal, External, Email, Phone
+    section: str
+    new_tab: bool
+    count: int = 1
+
+
+@dataclass
 class AuditReport:
     base_url: str
     total_pages_crawled: int = 0
@@ -90,6 +117,9 @@ class AuditReport:
     skipped_urls: set = field(default_factory=set)
     images_checked: int = 0
     image_issues: list = field(default_factory=list)
+    link_entries: list = field(default_factory=list)
+    # Normalized URL (no trailing slash) -> {"status", "final_url", "title"}
+    destinations: dict = field(default_factory=dict)
 
 
 class SiteAuditor:
@@ -106,6 +136,8 @@ class SiteAuditor:
         check_images: bool = False,
         image_attrs: tuple[str, ...] = ("alt", "title"),
         sitemap_only: bool = False,
+        list_links: bool = False,
+        skip_template_links: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.base_domain = urlparse(base_url).netloc
@@ -126,9 +158,12 @@ class SiteAuditor:
         self.image_attrs = image_attrs
         self.image_label = "/".join(image_attrs)  # "alt/title", "alt" or "title"
         self.sitemap_only = sitemap_only
-        # Search and image modes answer a different question, so they skip
-        # HTTP link validation.
-        self.validate_links = not (self.search_term or self.check_images)
+        self.list_links = list_links
+        self.skip_template_links = skip_template_links
+        # Search, image and link-list modes answer a different question, so
+        # they skip the broken-link validation.
+        self.validate_links = not (self.search_term or self.check_images or self.list_links)
+        self._link_rows_cache: list[dict] | None = None
 
         self.visited_urls: set = set()
         self.checked_links: set = set()
@@ -313,6 +348,185 @@ class SiteAuditor:
         if issues:
             self.log(f"  Found {issues} images missing {self.image_label}")
 
+    def collect_link_entries(self, page, current_url: str):
+        """Record every link on the page with its text, section and target."""
+        if not self.list_links:
+            return
+
+        try:
+            raw_links = page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href]')).map(a => {
+                    const img = a.querySelector('img[alt]');
+                    const name = (a.innerText || '').replace(/\\s+/g, ' ').trim()
+                        || a.getAttribute('aria-label') || a.getAttribute('title')
+                        || (img && img.getAttribute('alt')) || '';
+                    const landmarks = [
+                        ['header', 'header, [role=banner]'],
+                        ['footer', 'footer, [role=contentinfo]'],
+                        ['nav', 'nav, [role=navigation]'],
+                        ['aside', 'aside, [role=complementary]'],
+                        ['main', 'main, [role=main]'],
+                    ];
+                    const hit = landmarks.find(([, sel]) => a.closest(sel));
+                    return {
+                        href: a.getAttribute('href'),
+                        name: name.trim().slice(0, 150),
+                        section: hit ? hit[0] : 'body',
+                        newTab: a.getAttribute('target') === '_blank',
+                    };
+                })"""
+            )
+        except Exception as e:
+            self.log(f"  Error extracting link list: {e}")
+            return
+
+        entries: dict[tuple, LinkEntry] = {}
+        for raw in raw_links:
+            href = (raw["href"] or "").strip()
+            if href.startswith(("mailto:", "tel:")):
+                url = href
+                link_type = "Email" if href.startswith("mailto:") else "Phone"
+            else:
+                url = self.normalize_url(href, current_url)
+                if not url:
+                    continue  # javascript:, #anchors, data:
+                link_type = "Internal" if self.is_internal_url(url) else "External"
+                if link_type == "Internal" and self.should_skip(url):
+                    self.report.skipped_urls.add(url)
+
+            name = raw["name"] or "[no text]"
+            key = (url, name, raw["section"])
+            if key in entries:
+                entries[key].count += 1
+            else:
+                entries[key] = LinkEntry(
+                    page_url=current_url,
+                    name=name,
+                    url=url,
+                    link_type=link_type,
+                    section=raw["section"],
+                    new_tab=raw["newTab"],
+                )
+
+        self.report.link_entries.extend(entries.values())
+        self._link_rows_cache = None
+
+    def record_destination(self, url: str, status, final_url: str, title: str):
+        """Remember where a URL ended up, so links to it can be compared against it."""
+        self.report.destinations[url.rstrip("/")] = {
+            "status": status,
+            "final_url": final_url,
+            "title": title,
+        }
+
+    def fetch_destination(self, url: str):
+        """Fetch a page that wasn't crawled to learn its status, final URL and <title>."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        try:
+            resp = req_lib.get(url, timeout=15, headers=headers, allow_redirects=True, stream=True)
+            head = resp.raw.read(262144, decode_content=True).decode(resp.encoding or "utf-8", "replace")
+            resp.close()
+            match = re.search(r"<title[^>]*>(.*?)</title>", head, re.IGNORECASE | re.DOTALL)
+            title = re.sub(r"\s+", " ", html_lib.unescape(match.group(1))).strip() if match else ""
+            self.record_destination(url, resp.status_code, resp.url, title)
+        except Exception as e:
+            self.record_destination(url, "ERROR", "", str(e)[:200])
+
+    def resolve_link_destinations(self):
+        """Fetch destinations of listed links that the crawl didn't visit."""
+        if not self.list_links:
+            return
+
+        pending = set()
+        for entry in self.report.link_entries:
+            if entry.link_type not in ("Internal", "External"):
+                continue
+            if entry.url.rstrip("/") in self.report.destinations:
+                continue
+            if entry.link_type == "External" and not self.check_external:
+                continue
+            if entry.link_type == "Internal" and self.should_skip(entry.url):
+                continue
+            pending.add(entry.url)
+
+        if not pending:
+            return
+        self.log(f"Fetching {len(pending)} link destinations that weren't crawled...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(self.fetch_destination, pending))
+        self._link_rows_cache = None
+
+    def _is_homepage(self, url: str) -> bool:
+        return urlparse(url).path in ("", "/", "/index.htm", "/index.html")
+
+    def _link_notes(self, entry: LinkEntry, dest: dict | None) -> list[str]:
+        """Heuristics that point at links going to the wrong page."""
+        if not dest:
+            return []
+        status = dest["status"]
+        if status in ("ERROR", "TIMEOUT"):
+            return [f"error: {dest['title']}" if status == "ERROR" and dest["title"] else "error"]
+
+        notes = []
+        if isinstance(status, int) and status >= 400:
+            notes.append(f"broken ({status})")
+        final_url = dest["final_url"] or entry.url
+        if self._is_homepage(final_url) and not self._is_homepage(entry.url):
+            notes.append("redirects to homepage")
+
+        if not self._is_homepage(entry.url) and not notes:
+            words = [
+                w for w in re.findall(r"[a-z0-9]+", entry.name.lower())
+                if len(w) >= 3 and w not in GENERIC_LINK_WORDS
+            ]
+            haystack = f"{dest['title']} {urlparse(final_url).path} {urlparse(final_url).query}"
+            haystack = re.sub(r"[-_/+=&?.%]", " ", haystack.lower())
+            if words and not any((w[:5] if len(w) > 5 else w) in haystack for w in words):
+                notes.append("text not found in destination")
+        return notes
+
+    def link_rows(self) -> list[dict]:
+        """Listed links enriched with destination info, template flag and notes."""
+        if self._link_rows_cache is not None:
+            return self._link_rows_cache
+
+        pages = {e.page_url for e in self.report.link_entries}
+        pages_per_link: dict[tuple, set] = {}
+        for e in self.report.link_entries:
+            pages_per_link.setdefault((e.url, e.name), set()).add(e.page_url)
+        repeat_threshold = (
+            max(TEMPLATE_REPEAT_MIN_PAGES, TEMPLATE_REPEAT_RATIO * len(pages))
+            if len(pages) >= TEMPLATE_REPEAT_MIN_PAGES
+            else float("inf")
+        )
+
+        rows = []
+        for e in self.report.link_entries:
+            template = (
+                e.section in TEMPLATE_SECTIONS
+                or len(pages_per_link[(e.url, e.name)]) >= repeat_threshold
+            )
+            if template and self.skip_template_links:
+                continue
+            dest = self.report.destinations.get(e.url.rstrip("/"))
+            if dest is None and e.link_type == "Internal" and self.should_skip(e.url):
+                status = "SKIPPED"
+            else:
+                status = dest["status"] if dest else ""
+            final_url = dest["final_url"] if dest else ""
+            rows.append({
+                "entry": e,
+                "template": template,
+                "status": status,
+                "lands_on": final_url if final_url and final_url.rstrip("/") != e.url.rstrip("/") else "",
+                "dest_title": dest["title"] if dest and dest["status"] != "ERROR" else "",
+                "notes": self._link_notes(e, dest),
+            })
+        self._link_rows_cache = rows
+        return rows
+
     def check_link(self, url: str, source_page: str, link_text: str) -> LinkResult:
         """Check if a link is working using requests library. Detects redirects by comparing final URL."""
         is_external = not self.is_internal_url(url)
@@ -431,6 +645,8 @@ class SiteAuditor:
             mode_label = f"content search for '{self.search_term}'"
         elif self.check_images:
             mode_label = f"image {self.image_label} audit"
+        elif self.list_links:
+            mode_label = "link listing"
         else:
             mode_label = "broken-link audit"
         self.log(f"Starting {mode_label} of {self.base_url}")
@@ -478,6 +694,9 @@ class SiteAuditor:
 
                     self.collect_search_matches(page, current_url, links)
                     self.collect_image_issues(page, current_url)
+                    if self.list_links:
+                        self.record_destination(current_url, response.status, page.url, page.title())
+                        self.collect_link_entries(page, current_url)
 
                     # With --sitemap-only, only the start page's links are followed.
                     follow_links = not self.sitemap_only or depth == 0
@@ -514,6 +733,7 @@ class SiteAuditor:
 
                 except PlaywrightTimeout:
                     self.log(f"  Timeout loading {current_url} (all retries exhausted)")
+                    self.record_destination(current_url, "TIMEOUT", "", "")
                     self.report.errors.append(
                         LinkResult(
                             url=current_url,
@@ -526,6 +746,7 @@ class SiteAuditor:
                     )
                 except Exception as e:
                     self.log(f"  Error crawling {current_url}: {e}")
+                    self.record_destination(current_url, "ERROR", "", str(e)[:200])
                     self.report.errors.append(
                         LinkResult(
                             url=current_url,
@@ -539,6 +760,7 @@ class SiteAuditor:
 
             browser.close()
 
+        self.resolve_link_destinations()
         self.log("-" * 60)
         self.log("Crawl complete!")
 
@@ -549,6 +771,9 @@ class SiteAuditor:
             return
         if self.check_images:
             self.generate_images_csv_report(filename)
+            return
+        if self.list_links:
+            self.generate_links_csv_report(filename)
             return
 
         with open(filename, "w", newline="", encoding="utf-8") as f:
@@ -648,6 +873,49 @@ class SiteAuditor:
 
         self.log(f"CSV image report saved to: {filename}")
 
+    def flagged_link_groups(self) -> list[tuple[dict, list[str]]]:
+        """Flagged links, each listed once with the pages it appears on."""
+        groups: dict[tuple, tuple[dict, list[str]]] = {}
+        for r in self.link_rows():
+            if not r["notes"]:
+                continue
+            e = r["entry"]
+            key = (e.url, e.name, tuple(r["notes"]))
+            if key not in groups:
+                groups[key] = (r, [])
+            if e.page_url not in groups[key][1]:
+                groups[key][1].append(e.page_url)
+        return sorted(groups.values(), key=lambda g: -len(g[1]))
+
+    def generate_links_csv_report(self, filename: str):
+        """Generate a CSV report with one row per link per page."""
+        page_titles = {url: d["title"] for url, d in self.report.destinations.items()}
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "Page URL", "Page Title", "Section", "Template", "Link Text", "Link URL",
+                "Type", "New Tab", "Count", "Status", "Lands On", "Destination Title", "Notes",
+            ])
+            for row in self.link_rows():
+                e = row["entry"]
+                writer.writerow([
+                    e.page_url,
+                    page_titles.get(e.page_url.rstrip("/"), ""),
+                    e.section,
+                    "Yes" if row["template"] else "No",
+                    e.name,
+                    e.url,
+                    e.link_type,
+                    "Yes" if e.new_tab else "",
+                    e.count,
+                    row["status"],
+                    row["lands_on"],
+                    row["dest_title"],
+                    "; ".join(row["notes"]),
+                ])
+
+        self.log(f"CSV link list saved to: {filename}")
+
     def _group_image_issues(self) -> list[tuple[str, str, list[str]]]:
         """Group image issues by (image URL, missing) -> pages, most widespread first."""
         groups: dict[tuple[str, str], list[str]] = {}
@@ -673,6 +941,9 @@ class SiteAuditor:
             return
         if self.check_images:
             self.generate_images_html_report(filename)
+            return
+        if self.list_links:
+            self.generate_links_html_report(filename)
             return
 
         html = f"""<!DOCTYPE html>
@@ -1000,6 +1271,144 @@ class SiteAuditor:
 
         self.log(f"HTML image report saved to: {filename}")
 
+    def generate_links_html_report(self, filename: str):
+        """Generate an HTML report: flagged links first, then every link grouped by page."""
+        safe_base_url = escape(self.base_url)
+        rows = self.link_rows()
+        flagged = self.flagged_link_groups()
+        by_page: dict[str, list[dict]] = {}
+        for r in rows:
+            by_page.setdefault(r["entry"].page_url, []).append(r)
+        template_count = sum(1 for r in rows if r["template"])
+        template_label = "Template Links Hidden" if self.skip_template_links else "Template Links"
+        if self.skip_template_links:
+            template_count = len(self.report.link_entries) - len(rows)
+
+        def link_cell(r):
+            e = r["entry"]
+            ext = ' <span class="muted">(new tab)</span>' if e.new_tab else ""
+            return f'<a href="{escape(e.url)}" target="_blank" rel="noopener">{escape(e.url)}</a>{ext}'
+
+        def dest_cell(r):
+            parts = []
+            if r["status"] != "":
+                parts.append(f'<span class="badge">{escape(str(r["status"]))}</span>')
+            if r["lands_on"]:
+                parts.append(f'→ {escape(r["lands_on"])}')
+            if r["dest_title"]:
+                parts.append(f'<div class="title">{escape(r["dest_title"])}</div>')
+            return " ".join(parts)
+
+        def notes_cell(r):
+            return "".join(f'<span class="flag">{escape(n)}</span>' for n in r["notes"])
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Link List - {safe_base_url}</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f5f5f5; }}
+        .container {{ max-width: 1400px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        h1 {{ color: #333; border-bottom: 2px solid #007bff; padding-bottom: 10px; }}
+        h2 {{ color: #555; margin-top: 30px; }}
+        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; margin: 20px 0; }}
+        .stat {{ background: #f8f9fa; padding: 20px; border-radius: 8px; text-align: center; }}
+        .stat-number {{ font-size: 2em; font-weight: bold; }}
+        .stat-label {{ color: #666; margin-top: 5px; }}
+        .broken {{ color: #dc3545; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.92em; }}
+        th, td {{ padding: 8px 10px; text-align: left; border-bottom: 1px solid #ddd; vertical-align: top; }}
+        th {{ background: #f8f9fa; font-weight: 600; }}
+        tr:hover {{ background: #f8f9fa; }}
+        td {{ word-break: break-word; }}
+        a {{ color: #0d6efd; }}
+        .muted {{ color: #6c757d; font-size: 0.85em; }}
+        .title {{ color: #333; margin-top: 3px; }}
+        .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; background: #e9ecef; font-size: 0.85em; }}
+        .flag {{ display: inline-block; margin: 0 4px 4px 0; padding: 2px 6px; border-radius: 4px; background: #f8d7da; color: #721c24; font-size: 0.85em; }}
+        .tpl {{ color: #6c757d; }}
+        td details {{ border: none; margin: 0; padding: 0; }}
+        td details ul {{ margin: 6px 0 0; padding-left: 18px; }}
+        details {{ border: 1px solid #e5e5e5; border-radius: 6px; margin: 10px 0; padding: 8px 12px; }}
+        summary {{ cursor: pointer; font-weight: 600; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 Link List</h1>
+        <p><strong>URL:</strong> {safe_base_url}{" (sitemap only)" if self.sitemap_only else ""}<br>
+        <strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+        <div class="summary">
+            <div class="stat"><div class="stat-number">{self.report.total_pages_crawled}</div><div class="stat-label">Pages Crawled</div></div>
+            <div class="stat"><div class="stat-number">{len(rows)}</div><div class="stat-label">Links Listed</div></div>
+            <div class="stat"><div class="stat-number broken">{len(flagged)}</div><div class="stat-label">Flagged Links (unique)</div></div>
+            <div class="stat"><div class="stat-number">{template_count}</div><div class="stat-label">{template_label}</div></div>
+            <div class="stat"><div class="stat-number">{len(self.report.skipped_urls)}</div><div class="stat-label">URLs Skipped</div></div>
+        </div>
+"""
+
+        if flagged:
+            html += """
+        <h2>⚠️ Flagged Links</h2>
+        <p class="muted">Hints, not verdicts: check that each link goes where its text says. Each link is listed once; the CSV has one row per page.</p>
+        <table>
+            <tr><th>Link Text</th><th>Link URL</th><th>Destination</th><th>Notes</th><th>Found On</th></tr>
+"""
+            for r, pages in flagged:
+                page_items = "".join(f"<li>{escape(p)}</li>" for p in pages)
+                label = "1 page" if len(pages) == 1 else f"{len(pages)} pages"
+                html += f"""            <tr>
+                <td>{escape(r["entry"].name)}</td>
+                <td>{link_cell(r)}</td>
+                <td>{dest_cell(r)}</td>
+                <td>{notes_cell(r)}</td>
+                <td><details><summary>{label}</summary><ul>{page_items}</ul></details></td>
+            </tr>
+"""
+            html += "        </table>\n"
+
+        html += """
+        <h2>Links by Page</h2>
+"""
+        for page_url, page_rows in by_page.items():
+            page_title = self.report.destinations.get(page_url.rstrip("/"), {}).get("title", "")
+            n_flagged = sum(1 for r in page_rows if r["notes"])
+            flag_label = f' · <span class="broken">{n_flagged} flagged</span>' if n_flagged else ""
+            html += f"""        <details>
+            <summary>{escape(page_url)} <span class="muted">{escape(page_title)} · {len(page_rows)} links</span>{flag_label}</summary>
+            <table>
+                <tr><th>Section</th><th>Link Text</th><th>Link URL</th><th>Type</th><th>Destination</th><th>Notes</th></tr>
+"""
+            for r in page_rows:
+                e = r["entry"]
+                section = escape(e.section) + (' <span class="tpl">(template)</span>' if r["template"] else "")
+                count = f' <span class="muted">×{e.count}</span>' if e.count > 1 else ""
+                html += f"""                <tr>
+                    <td>{section}</td>
+                    <td>{escape(e.name)}{count}</td>
+                    <td>{link_cell(r)}</td>
+                    <td>{escape(e.link_type)}</td>
+                    <td>{dest_cell(r)}</td>
+                    <td>{notes_cell(r)}</td>
+                </tr>
+"""
+            html += """            </table>
+        </details>
+"""
+
+        html += """
+    </div>
+</body>
+</html>
+"""
+
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html)
+
+        self.log(f"HTML link list saved to: {filename}")
+
     def print_summary(self):
         """Print a summary to console."""
         if self.search_term:
@@ -1007,6 +1416,9 @@ class SiteAuditor:
             return
         if self.check_images:
             self.print_images_summary()
+            return
+        if self.list_links:
+            self.print_links_summary()
             return
 
         print("\n" + "=" * 60)
@@ -1098,12 +1510,43 @@ class SiteAuditor:
             if len(groups) > 20:
                 print(f"  ... and {len(groups) - 20} more")
 
+    def print_links_summary(self):
+        """Print a link-list summary to console."""
+        rows = self.link_rows()
+        flagged = self.flagged_link_groups()
+
+        print("\n" + "=" * 60)
+        print("LINK LIST SUMMARY")
+        print("=" * 60)
+        print(f"Base URL:        {self.base_url}")
+        print(f"Pages crawled:   {self.report.total_pages_crawled}")
+        print(f"Links listed:    {len(rows)}")
+        if self.skip_template_links:
+            print(f"Template hidden: {len(self.report.link_entries) - len(rows)}")
+        else:
+            print(f"Template links:  {sum(1 for r in rows if r['template'])}")
+        print(f"Flagged links:   {len(flagged)} unique")
+        print(f"URLs skipped:    {len(self.report.skipped_urls)}")
+        print("=" * 60)
+
+        if flagged:
+            print("\nFLAGGED LINKS:")
+            for r, pages in flagged[:20]:
+                e = r["entry"]
+                print(f"  [{'; '.join(r['notes'])}] \"{e.name}\" -> {e.url}")
+                if r["dest_title"]:
+                    print(f"       Destination: {r['dest_title']}")
+                print(f"       On {len(pages)} page(s), e.g. {pages[0]}")
+            if len(flagged) > 20:
+                print(f"  ... and {len(flagged) - 20} more")
+
 
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Crawl a website and check for broken links, search crawled pages "
-            "for a word/phrase, or find images missing alt/title (handles JavaScript sites)"
+            "for a word/phrase, find images missing alt/title, or list every link per "
+            "page (handles JavaScript sites)"
         )
     )
     parser.add_argument("url", help="The URL to audit")
@@ -1134,6 +1577,19 @@ def main():
         "--check-images",
         action="store_true",
         help="Report <img> elements missing alt or title instead of validating links",
+    )
+    mode.add_argument(
+        "--list-links",
+        action="store_true",
+        help=(
+            "List every link on every page (text, URL, section, where it lands) and "
+            "flag links that may point to the wrong page, instead of validating links"
+        ),
+    )
+    parser.add_argument(
+        "--skip-template-links",
+        action="store_true",
+        help="With --list-links, leave out header/nav/footer links and links repeated on most pages",
     )
     image_attr = parser.add_mutually_exclusive_group()
     image_attr.add_argument(
@@ -1174,9 +1630,11 @@ def main():
     args = parser.parse_args()
 
     if args.alt_only or args.title_only:
-        if args.search_term:
-            parser.error("--alt-only/--title-only cannot be combined with --search-term")
+        if args.search_term or args.list_links:
+            parser.error("--alt-only/--title-only cannot be combined with --search-term or --list-links")
         args.check_images = True
+    if args.skip_template_links and not args.list_links:
+        parser.error("--skip-template-links only works with --list-links")
     if args.alt_only:
         image_attrs = ("alt",)
     elif args.title_only:
@@ -1206,6 +1664,8 @@ def main():
         check_images=args.check_images,
         image_attrs=image_attrs,
         sitemap_only=args.sitemap_only,
+        list_links=args.list_links,
+        skip_template_links=args.skip_template_links,
     )
 
     try:

@@ -1,10 +1,11 @@
 # Site Link Auditor
 
-Crawl a website with a real (headless) browser and get an HTML/CSV report of either:
+Crawl a website with a real (headless) browser and get an HTML/CSV report of one of:
 
 - **Broken links** — 4xx/5xx, redirects and connection errors (default mode), or
 - **Where a word or phrase appears** — e.g. every page that mentions `"Royal Motors"` (`--search-term`), or
-- **Images missing `alt` and/or `title`** (`--check-images`, or `--alt-only` / `--title-only`).
+- **Images missing `alt` and/or `title`** (`--check-images`, or `--alt-only` / `--title-only`), or
+- **Every link on every page** — text, URL, where it lands — with links that may go to the wrong page flagged (`--list-links`).
 
 Any mode can be limited to the pages listed on the site's sitemap page (`--sitemap-only`).
 
@@ -73,6 +74,8 @@ playwright install chromium
 | Find images without alt/title | `python site_auditor.py https://example.com --check-images -o reports/images` |
 | …only missing alt | `python site_auditor.py https://example.com --alt-only -o reports/alt` |
 | …only missing title | `python site_auditor.py https://example.com --title-only -o reports/title` |
+| List every link per page and flag wrong destinations | `python site_auditor.py https://example.com --list-links -o reports/links` |
+| …only content links (no header/footer/nav) | `python site_auditor.py https://example.com/sitemap.htm --sitemap-only --skip-inventory --list-links --skip-template-links -o reports/links` |
 | …only on sitemap pages, without inventory | `python site_auditor.py https://example.com/sitemap.htm --sitemap-only --skip-inventory --check-images -o reports/images` |
 | Test quickly on a few pages | add `--max-pages 20` |
 | Ignore dealer inventory / blog pages | add `--skip-inventory --skip-blogs` |
@@ -92,7 +95,7 @@ python site_auditor.py https://example.com \
 
 ---
 
-## The two modes
+## The modes
 
 ### 1. Broken-link audit (default)
 
@@ -133,7 +136,41 @@ Crawls the same way but **does not check links**. Instead it reports every `<img
 - 1×1 tracking pixels are ignored. Lazy-loaded images are covered when the URL is in `src` or `data-src`.
 - Only `<img>` tags are checked — not CSS background images or inline `<svg>`. Images the site only adds after scrolling may be missed.
 - Shared images (logo, header, footer) appear on every page. The HTML report lists each image **once** with the pages it appears on; the CSV has one row per page.
-- None of the image flags can be combined with `--search-term`.
+- None of the image flags can be combined with `--search-term` or `--list-links`.
+
+### 4. Link list (`--list-links`)
+
+Crawls the same way but, instead of a pass/fail check, **lists every link on every page** and tells you where each one actually lands, so you can spot links that go to the wrong page (e.g. "Get Pre-Approved" pointing to the Service page).
+
+For each link it records:
+
+| Field | Meaning |
+|---|---|
+| Link Text | Visible text; falls back to `aria-label`, `title`, or the `alt` of an image inside the link. `[no text]` if none. |
+| Link URL | Absolute URL (`#fragment` removed). `tel:` and `mailto:` links are listed too; `javascript:` and `#anchor` links are not. |
+| Section | Where on the page the link is: `header`, `nav`, `footer`, `aside`, `main`, or `body` (none of those). |
+| Template | `Yes` for links in `header`/`nav`/`footer`, or repeated (same text + URL) on ≥ 80% of crawled pages (once at least 5 pages are crawled). Catches headers/footers built from plain `<div>`s. |
+| Destination | HTTP status, the final URL if it redirects (**Lands On**), and the destination page's `<title>`. |
+| Notes | Why the link was flagged (see below). |
+
+**Flags** (hints, not verdicts — always confirm by opening the link):
+
+| Note | Meaning |
+|---|---|
+| `broken (404)` | Destination returns 4xx/5xx. |
+| `error` | Destination couldn't be loaded. |
+| `redirects to homepage` | Link points to an inner page but ends up on the homepage — typical of a removed page. |
+| `text not found in destination` | None of the meaningful words in the link text (ignoring generic ones like "view", "more", "click here") appear in the destination's title or URL. E.g. "Get Pre-Approved" → *Service Department*. Expect some false positives (e.g. "Meet our team" → *About Us*). |
+
+How destinations are resolved:
+
+- Pages the crawl visits use the browser's result (final URL and title after JavaScript).
+- Internal links the crawl didn't visit (e.g. links on the pages listed by `--sitemap-only`) are fetched once with a plain HTTP request to get status, final URL and `<title>`.
+- External links are only resolved with `--check-external`. Links to skipped URLs (`--skip-inventory`, etc.) are listed with status `SKIPPED` and are not resolved.
+
+`--skip-template-links` leaves template links out of the report, so it only shows each page's own content links. Without it, template links are listed and marked `(template)`.
+
+A link repeated on the same page with the same text and section is listed once, with a **Count**.
 
 ### Limiting to the sitemap (`--sitemap-only`)
 
@@ -190,6 +227,8 @@ The starting URL is never skipped.
 | `--check-images` | off | Switch to image mode: report `<img>` elements missing `alt` or `title`. |
 | `--alt-only` | off | Image mode checking only `alt` (implies `--check-images`). |
 | `--title-only` | off | Image mode checking only `title` (implies `--check-images`). |
+| `--list-links` | off | Link-list mode: every link per page with its destination, flagging possible wrong links. |
+| `--skip-template-links` | off | With `--list-links`, leave out header/nav/footer and site-wide repeated links. |
 | `--sitemap-only` | off | Only visit the start URL and the internal pages it links to (pass the sitemap page as `url`). |
 | `--skip-inventory` | off | Skip vehicle detail pages and faceted inventory searches. |
 | `--skip-blogs` | off | Skip `/blog/` pages. |
@@ -253,9 +292,33 @@ Each run prints a summary to the console and writes `<output>.html` and/or `<out
 
 Counts in the summary (Missing Alt / Missing Title) are per image occurrence, so a logo without a title on 40 pages counts 40.
 
+### Link-list reports
+
+**HTML**: summary cards (pages crawled, links listed, flagged links, template links, URLs skipped), then:
+
+1. **Flagged Links** — each suspicious link listed **once**, with destination, notes and a collapsible list of pages where it appears (a wrong header link shows up as one row with "40 pages").
+2. **Links by Page** — one collapsible block per page (with its title, link count and number flagged) containing every link on it.
+
+**CSV** — one row per link per page, ready to filter:
+
+| Column | Meaning |
+|---|---|
+| Page URL / Page Title | Page the link is on. |
+| Section | `header`, `nav`, `footer`, `aside`, `main` or `body`. |
+| Template | `Yes` / `No` (see above). |
+| Link Text / Link URL | The link. |
+| Type | `Internal`, `External`, `Email` or `Phone`. |
+| New Tab | `Yes` if it opens in a new tab (`target="_blank"`). |
+| Count | Times the same link appears in that section of the page. |
+| Status | Destination HTTP status, `ERROR`, `TIMEOUT`, `SKIPPED`, or blank if not resolved. |
+| Lands On | Final URL, only when it differs from the link URL. |
+| Destination Title | `<title>` of the destination page. |
+| Notes | Flags, separated by `;`. Filter non-empty Notes to get the suspicious links. |
+
 ### Interrupting a run
 
 Press **Ctrl+C** at any time: the summary is printed and partial reports are saved as `<output>_partial.html` and `<output>_partial.csv` (always both formats, regardless of `-f`).
+In link-list mode, destinations of links the crawl hadn't visited yet are left blank in partial reports.
 
 ---
 
@@ -265,6 +328,7 @@ Press **Ctrl+C** at any time: the summary is printed and partial reports are sav
 2. **Check links** (audit mode) — new links from each page are checked in parallel (10 workers) with an HTTP `HEAD`, falling back to `GET` if the server answers 405 or refuses the connection. Redirects are followed and detected by comparing the final URL with the original.
 3. **Search** (search mode) — instead of step 2, the page's visible text and its links are scanned for the term.
    **Images** (image mode) — instead of step 2, every `<img>` in the rendered page is checked for `alt` and `title`.
+   **Link list** (link-list mode) — instead of step 2, every link is recorded with its section; after the crawl, destinations not visited are fetched and each link is compared against where it lands.
 4. **Report** — summary to console, then HTML/CSV files.
 
 ---
