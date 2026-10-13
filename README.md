@@ -9,6 +9,8 @@ Crawl a website with a real (headless) browser and get an HTML/CSV report of one
 
 Any mode can be limited to the pages listed on the site's sitemap page (`--sitemap-only`).
 
+A second tool, **`orphan_finder.py`**, lists **orphan pages**: pages that are live but not linked from anywhere on the site (see [Orphan pages](#orphan-pages-orphan_finderpy)).
+
 Because it uses Playwright + Chromium, it sees links and text rendered by JavaScript that plain HTTP scrapers miss.
 
 ---
@@ -70,6 +72,7 @@ playwright install chromium
 | Find broken internal links | `python site_auditor.py https://example.com -o reports/example` |
 | …and external links too | `python site_auditor.py https://example.com --check-external -o reports/example` |
 | Find every page mentioning a word | `python site_auditor.py https://example.com --search-term GMC -o reports/gmc` |
+| Find live pages not linked anywhere (orphans) | `python orphan_finder.py https://example.com --skip-inventory -o reports/orphans` |
 | Find a multi-word phrase | `python site_auditor.py https://example.com --search-term "Royal Motors" -o reports/royal` |
 | Find images without alt/title | `python site_auditor.py https://example.com --check-images -o reports/images` |
 | …only missing alt | `python site_auditor.py https://example.com --alt-only -o reports/alt` |
@@ -190,6 +193,67 @@ python site_auditor.py https://osteensubaruofvaldostasoa.cms.dealer.com/sitemap.
 - In audit mode, the links on each listed page are still checked; only the crawl stops at one level.
 
 ---
+
+## Orphan pages (`orphan_finder.py`)
+
+Lists pages that are **live but not linked from anywhere on the site**: not in the desktop or mobile navigation, homepage content, footer, or any other page reachable from the homepage. For each one: **page title and live URL**.
+
+```bash
+python orphan_finder.py https://example.com --skip-inventory -o reports/example_orphans
+```
+
+A crawler can't discover orphan pages by following links (nothing links to them), so the tool compares two lists:
+
+1. **Declared pages** — every page the site says it has:
+   - the HTML sitemap (`/sitemap.htm`, or `--html-sitemap URL`),
+   - the XML sitemap (`/sitemap.xml` plus any `Sitemap:` listed in `robots.txt`, or `--xml-sitemap URL`; sitemap indexes are followed),
+   - optionally, a page list exported from the CMS (`--pages-file pages.csv`).
+2. **Linked pages** — every page linked from a page reachable from the homepage. The site is crawled twice, **as desktop and as mobile** (phone screen and user agent), since sites can render different menus for each. Links hidden in collapsed menus count, as they are in the page.
+
+**Orphan = declared, not linked by either crawl, and loads with 200 on its own URL.** Declared pages that redirect or don't load are listed separately as *Unlinked but Not Live*.
+
+Rules that matter:
+
+- **The HTML sitemap is never a link source.** It links every page, so counting it would hide every orphan. The sitemap page is visited, but its links are ignored.
+- **Pages are matched by path**, ignoring case, query string, trailing slash, `index.htm` and host. So `/About.htm`, `/about.htm?utm=x` and `https://www.live-domain.com/about.htm` are the same page. Hosts found in `sitemap.xml` (e.g. the live domain when you audit the `cms.dealer.com` host) count as the same site.
+- A link that redirects makes its destination linked too.
+- Files (`.pdf`, images, …) are never reported.
+- The skip flags (`--skip-inventory`, `--skip-blogs`, `--exclude`) apply to both lists: skipped pages are neither crawled nor reported. Use `--skip-inventory` on dealer sites, or every vehicle page in `sitemap.xml` is checked.
+
+**Pages hidden from the sitemaps** are the most likely orphans, and only a CMS export finds them. Pass any text or CSV file with one URL or path (`/page.htm`) per line; the first cell that looks like a URL/path is used and other columns or headers are ignored:
+
+```bash
+python orphan_finder.py https://example.com --skip-inventory --pages-file cms_pages.csv -o reports/orphans
+```
+
+**Report**
+
+- **HTML**: summary (declared pages, pages crawled per device, orphans, not live, crawl errors), then:
+  - **Orphan Pages**: #, page title, live URL, where it was declared.
+  - **Unlinked but Not Live**: status and redirect target.
+  - **Linked on One Device Only**: not orphans, but only reachable on desktop *or* mobile (e.g. a page only in the mobile menu). Useful context for the same request.
+  - **Crawl Errors**: pages that failed to load. Their links weren't seen, so orphans linked only from them may be false positives.
+- **CSV**: one row per orphan with `Page Title`, `Live URL`, `Found In`, ready to send to the client (drop `Found In` if not needed).
+
+**Options**
+
+| Option | Default | Description |
+|---|---|---|
+| `url` | *(required)* | Site homepage. Run it against the **live domain** to get live URLs in the report. |
+| `--html-sitemap URL` | `<site>/sitemap.htm` | HTML sitemap page(s); repeatable. |
+| `--xml-sitemap URL` | `<site>/sitemap.xml` + `robots.txt` | XML sitemap(s); repeatable. |
+| `--pages-file FILE` | — | Extra declared pages, e.g. a CMS export. |
+| `--desktop-only` | off | Skip the mobile crawl (about twice as fast). |
+| `--max-pages N` | `0` (unlimited) | Max pages per device crawl. **Leave unlimited for real audits**: a cut-short crawl reports linked pages as orphans (the report warns when this happens). |
+| `--timeout MS` | `60000` | Page load timeout. |
+| `-o`, `-f`, `-q` | | Output path, format and quiet mode, as in `site_auditor.py`. |
+| `--skip-inventory`, `--skip-blogs`, `--exclude` | | See [Skipping pages](#skipping-pages). |
+
+Notes:
+
+- Ctrl+C stops without writing a report: a partial crawl would list reachable pages as orphans.
+- Only real `<a href>` links count. A page reachable only through a button with a JavaScript click handler, a form, or a search box is reported as an orphan.
+- Takes roughly two full crawls plus one page load per candidate orphan. Use `--desktop-only` for a quicker first pass.
 
 ## Skipping pages
 
@@ -355,7 +419,9 @@ In link-list mode, destinations of links the crawl hadn't visited yet are left b
 
 ```
 crawl/
-├── site_auditor.py    # The whole tool (single file, no config)
+├── site_auditor.py    # Broken links, search, images, link list
+├── orphan_finder.py   # Orphan pages (live but not linked)
+├── crawl_common.py    # Shared by both: navigation, URL helpers, skip filters
 ├── README.md
 └── reports/           # Your reports (create it; ignored by git)
 ```

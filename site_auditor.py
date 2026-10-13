@@ -28,24 +28,19 @@ from urllib.parse import urljoin, urlparse
 
 import requests as req_lib
 
-try:
-    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-except ModuleNotFoundError:
-    sync_playwright = None
-    PlaywrightTimeout = TimeoutError
-
-
-# Template-generated pages multiply into thousands of near-identical URLs and
-# exhaust --max-pages before editorial pages are reached.
-URL_SKIP_PRESETS = {
-    "inventory": [
-        # Vehicle detail pages: /new/Chevrolet/2026-...-<32 hex id>.htm
-        r"/(new|used|certified)/.+-[0-9a-f]{32}\.htm",
-        # Faceted inventory searches: /new-inventory/index.htm?model=...
-        r"/[\w-]*inventory/[^?]*\?",
-    ],
-    "blogs": [r"/blog/"],
-}
+from crawl_common import (
+    PLAYWRIGHT_MISSING,
+    USER_AGENT,
+    PlaywrightTimeout,
+    add_skip_args,
+    compile_skip_patterns,
+    ensure_scheme,
+    goto_with_retry,
+    matches_skip,
+    normalize_url,
+    skip_patterns_from_args,
+    sync_playwright,
+)
 
 # Link-text words too generic to say anything about where a link should go.
 GENERIC_LINK_WORDS = {
@@ -153,7 +148,7 @@ class SiteAuditor:
             else None
         )
 
-        self.skip_patterns = [re.compile(p, re.IGNORECASE) for p in (skip_patterns or [])]
+        self.skip_patterns = compile_skip_patterns(skip_patterns)
         self.check_images = check_images
         self.image_attrs = image_attrs
         self.image_label = "/".join(image_attrs)  # "alt/title", "alt" or "title"
@@ -184,32 +179,11 @@ class SiteAuditor:
         """Check if URL matches a configured skip pattern."""
         if url.rstrip("/") == self.base_url:
             return False
-        parsed = urlparse(url)
-        target = parsed.path + (f"?{parsed.query}" if parsed.query else "")
-        return any(p.search(target) for p in self.skip_patterns)
+        return matches_skip(url, self.skip_patterns)
 
     def normalize_url(self, url: str, current_page: str) -> str | None:
         """Normalize and validate a URL."""
-        # Skip non-http links
-        if url.startswith(("mailto:", "tel:", "javascript:", "#", "data:")):
-            return None
-
-        # Make absolute URL
-        full_url = urljoin(current_page, url)
-
-        # Parse and clean
-        parsed = urlparse(full_url)
-
-        # Only process http/https
-        if parsed.scheme not in ("http", "https"):
-            return None
-
-        # Remove fragments
-        clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        if parsed.query:
-            clean_url += f"?{parsed.query}"
-
-        return clean_url
+        return normalize_url(url, current_page)
 
     def extract_links(self, page) -> list[tuple[str, str]]:
         """Extract all links from the current page."""
@@ -421,9 +395,7 @@ class SiteAuditor:
 
     def fetch_destination(self, url: str):
         """Fetch a page that wasn't crawled to learn its status, final URL and <title>."""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        headers = {"User-Agent": USER_AGENT}
         try:
             resp = req_lib.get(url, timeout=15, headers=headers, allow_redirects=True, stream=True)
             head = resp.raw.read(262144, decode_content=True).decode(resp.encoding or "utf-8", "replace")
@@ -530,9 +502,7 @@ class SiteAuditor:
     def check_link(self, url: str, source_page: str, link_text: str) -> LinkResult:
         """Check if a link is working using requests library. Detects redirects by comparing final URL."""
         is_external = not self.is_internal_url(url)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+        headers = {"User-Agent": USER_AGENT}
         link_timeout = 15  # seconds — much shorter than page nav timeout
 
         try:
@@ -604,42 +574,12 @@ class SiteAuditor:
 
     def _goto_with_retry(self, page, context, url: str):
         """Navigate to a URL with retry logic and fallback wait strategies."""
-        strategies = [
-            ("domcontentloaded", self.timeout),
-            ("commit", self.timeout),
-        ]
-        last_error = None
-        for wait_until, timeout in strategies:
-            try:
-                response = page.goto(url, timeout=timeout, wait_until=wait_until)
-                # Give JS a moment to render dynamic content
-                try:
-                    page.wait_for_load_state("load", timeout=5000)
-                except PlaywrightTimeout:
-                    pass  # load event is optional; domcontentloaded is enough
-                page.wait_for_timeout(1500)
-                return page, response
-            except PlaywrightTimeout:
-                self.log(f"  Timeout with wait_until='{wait_until}', retrying...")
-                last_error = PlaywrightTimeout(f"Timeout loading {url}")
-            except Exception as e:
-                # Page might be crashed; create a fresh one
-                self.log(f"  Page error ({e}), creating fresh page...")
-                try:
-                    page.close()
-                except Exception:
-                    pass
-                page = context.new_page()
-                last_error = e
-        raise last_error
+        return goto_with_retry(page, context, url, self.timeout, self.log)
 
     def crawl(self):
         """Main crawl loop."""
         if sync_playwright is None:
-            raise RuntimeError(
-                "Playwright is not installed. Install dependencies with "
-                "`pip install playwright requests` and then run `playwright install chromium`."
-            )
+            raise RuntimeError(PLAYWRIGHT_MISSING)
 
         if self.search_term:
             mode_label = f"content search for '{self.search_term}'"
@@ -661,7 +601,7 @@ class SiteAuditor:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent=USER_AGENT
             )
             page = context.new_page()
 
@@ -1610,21 +1550,7 @@ def main():
             "the site's /sitemap.htm); don't follow links any further"
         ),
     )
-    parser.add_argument(
-        "--skip-inventory",
-        action="store_true",
-        help="Skip template-generated inventory pages (vehicle detail pages and faceted searches)",
-    )
-    parser.add_argument(
-        "--skip-blogs", action="store_true", help="Skip blog pages (anything under /blog/)"
-    )
-    parser.add_argument(
-        "--exclude",
-        action="append",
-        default=[],
-        metavar="REGEX",
-        help="Skip internal URLs whose path+query matches this regex (repeatable)",
-    )
+    add_skip_args(parser)
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress verbose output")
 
     args = parser.parse_args()
@@ -1642,25 +1568,14 @@ def main():
     else:
         image_attrs = ("alt", "title")
 
-    # Ensure URL has scheme
-    url = args.url
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    skip_patterns = list(args.exclude)
-    if args.skip_inventory:
-        skip_patterns += URL_SKIP_PRESETS["inventory"]
-    if args.skip_blogs:
-        skip_patterns += URL_SKIP_PRESETS["blogs"]
-
     auditor = SiteAuditor(
-        base_url=url,
+        base_url=ensure_scheme(args.url),
         max_pages=args.max_pages,
         check_external=args.check_external,
         timeout=args.timeout,
         verbose=not args.quiet,
         search_term=args.search_term or "",
-        skip_patterns=skip_patterns,
+        skip_patterns=skip_patterns_from_args(args),
         check_images=args.check_images,
         image_attrs=image_attrs,
         sitemap_only=args.sitemap_only,
