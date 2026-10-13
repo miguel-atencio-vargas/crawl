@@ -18,6 +18,7 @@ import argparse
 import csv
 import re
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -65,6 +66,15 @@ ASSET_EXTENSIONS = (
 
 MAX_XML_SITEMAPS = 50
 
+# Rate limiting: wait and retry a 429/503, slowing down for the rest of the run.
+RATE_LIMIT_STATUSES = (429, 503)
+BACKOFF_SECONDS = (15, 45, 90)
+MAX_DELAY = 10.0
+
+# A device crawl that visits less than this share of another device's pages
+# most likely failed (blocked, rate limited) rather than finding a smaller menu.
+DEVICE_IMBALANCE_RATIO = 0.5
+
 
 @dataclass
 class DeclaredPage:
@@ -92,6 +102,7 @@ class OrphanFinder:
         max_pages: int = 0,
         timeout: int = 60000,
         skip_patterns: list[str] | None = None,
+        delay: float = 2.0,
         verbose: bool = True,
     ):
         parsed = urlparse(base_url)
@@ -109,16 +120,19 @@ class OrphanFinder:
         self.timeout = timeout
         self.skip_patterns = compile_skip_patterns(skip_patterns)
         self.verbose = verbose
+        self.delay = delay
+        self._last_request = 0.0
 
         self.sitemap_keys = {self.page_key(u) for u in self.html_sitemaps}
         self.declared: dict[str, DeclaredPage] = {}
         # page key -> {profile: first page linking to it}
         self.linked: dict[str, dict[str, str]] = {}
-        self.pages_crawled = {profile: 0 for profile in profiles}
-        self.crawl_errors: list[tuple[str, str, str]] = []
+        self.pages_crawled = {profile: 0 for profile in profiles}  # loaded successfully
+        self.crawl_errors: list[tuple[str, str, str]] = []  # (profile, url, reason)
         self.truncated: list[str] = []  # profiles whose crawl hit --max-pages
         self.orphans: list[CheckedPage] = []
         self.not_live: list[CheckedPage] = []
+        self.unverified: list[CheckedPage] = []  # still rate limited after retries
 
     def log(self, message: str):
         if self.verbose:
@@ -151,6 +165,32 @@ class OrphanFinder:
     def should_skip(self, url: str) -> bool:
         return self.page_key(url) != "/" and matches_skip(url, self.skip_patterns)
 
+    # --- Polite loading ----------------------------------------------------
+
+    def throttle(self):
+        """Keep at least self.delay seconds between requests."""
+        wait = self._last_request + self.delay - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request = time.monotonic()
+
+    def back_off(self, status: int, retry_after: str | None, attempt: int):
+        """Sleep after a rate-limit response and slow down every later request."""
+        wait = int(retry_after) if retry_after and retry_after.strip().isdigit() else BACKOFF_SECONDS[attempt]
+        self.delay = min(MAX_DELAY, max(self.delay * 2, 1.0))
+        self.log(f"  Rate limited (HTTP {status}): waiting {wait}s, then {self.delay:.1f}s between pages")
+        time.sleep(wait)
+
+    def load(self, page, context, url: str):
+        """goto_with_retry() plus throttling and retries on 429/503; returns (page, response)."""
+        for attempt in range(len(BACKOFF_SECONDS) + 1):
+            self.throttle()
+            page, response = goto_with_retry(page, context, url, self.timeout, self.log)
+            if response is None or response.status not in RATE_LIMIT_STATUSES or attempt == len(BACKOFF_SECONDS):
+                return page, response
+            self.back_off(response.status, response.headers.get("retry-after"), attempt)
+        return page, response
+
     # --- Step 1: declared pages --------------------------------------------
 
     def declare(self, url: str, source: str):
@@ -166,7 +206,7 @@ class OrphanFinder:
         for sitemap_url in self.html_sitemaps:
             self.log(f"Reading HTML sitemap: {sitemap_url}")
             try:
-                page, response = goto_with_retry(page, context, sitemap_url, self.timeout, self.log)
+                page, response = self.load(page, context, sitemap_url)
                 if response is None or response.status >= 400:
                     status = response.status if response else "no response"
                     self.log(f"  HTML sitemap not available ({status})")
@@ -184,11 +224,16 @@ class OrphanFinder:
         page.close()
 
     def _get_text(self, url: str) -> str | None:
-        try:
-            resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
-        except requests.RequestException as e:
-            self.log(f"  Could not fetch {url}: {e}")
-            return None
+        for attempt in range(len(BACKOFF_SECONDS) + 1):
+            self.throttle()
+            try:
+                resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+            except requests.RequestException as e:
+                self.log(f"  Could not fetch {url}: {e}")
+                return None
+            if resp.status_code not in RATE_LIMIT_STATUSES or attempt == len(BACKOFF_SECONDS):
+                break
+            self.back_off(resp.status_code, resp.headers.get("retry-after"), attempt)
         if resp.status_code >= 400:
             self.log(f"  {url} not available ({resp.status_code})")
             return None
@@ -259,16 +304,24 @@ class OrphanFinder:
         queue = deque([home])
         queued = {self.page_key(home)}
 
-        while queue and (self.max_pages == 0 or self.pages_crawled[profile] < self.max_pages):
+        attempts = 0
+        while queue and (self.max_pages == 0 or attempts < self.max_pages):
             url = queue.popleft()
-            self.pages_crawled[profile] += 1
+            attempts += 1
             limit = "inf" if self.max_pages == 0 else str(self.max_pages)
-            self.log(f"[{profile} {self.pages_crawled[profile]}/{limit}] {url}")
+            self.log(f"[{profile} {attempts}/{limit}] {url}")
 
             try:
-                page, response = goto_with_retry(page, context, url, self.timeout, self.log)
+                page, response = self.load(page, context, url)
                 if response is None:
                     continue
+                if response.status >= 400:
+                    # Its links weren't seen; a rate-limited page can hide linked pages.
+                    reason = "rate limited" if response.status in RATE_LIMIT_STATUSES else f"HTTP {response.status}"
+                    self.log(f"  Failed: {reason}")
+                    self.crawl_errors.append((profile, url, reason))
+                    continue
+                self.pages_crawled[profile] += 1
                 # A link that redirects makes the destination reachable too.
                 if self.is_site_url(page.url):
                     self.mark_linked(page.url, profile, f"(redirect from {url})")
@@ -317,7 +370,7 @@ class OrphanFinder:
         for declared in sorted(pages, key=lambda p: p.url):
             status, final_url, title = "ERROR", "", ""
             try:
-                page, response = goto_with_retry(page, context, declared.url, self.timeout, self.log)
+                page, response = self.load(page, context, declared.url)
                 if response is not None:
                     status, final_url, title = response.status, page.url, page.title().strip()
             except PlaywrightTimeout:
@@ -330,6 +383,9 @@ class OrphanFinder:
             if status == 200 and not redirected:
                 self.orphans.append(result)
                 self.log(f"  ORPHAN  {declared.url}  ({title})")
+            elif status in RATE_LIMIT_STATUSES:
+                self.unverified.append(result)
+                self.log(f"  could not verify [{status}] {declared.url}")
             else:
                 self.not_live.append(result)
                 detail = f"-> {final_url}" if redirected else ""
@@ -365,6 +421,46 @@ class OrphanFinder:
 
     # --- Reports -----------------------------------------------------------
 
+    def serious_crawl_errors(self) -> list[tuple[str, str, str]]:
+        """Crawl failures that may hide links (dead 4xx pages don't)."""
+        return [e for e in self.crawl_errors if not re.fullmatch(r"HTTP 4\d\d", e[2])]
+
+    def device_imbalance(self) -> str:
+        """Explain a device crawl that visited far fewer pages than the other, if any."""
+        if len(self.profiles) < 2:
+            return ""
+        most = max(self.pages_crawled.values())
+        for profile, count in self.pages_crawled.items():
+            if most >= 10 and count < most * DEVICE_IMBALANCE_RATIO:
+                return (
+                    f"The {profile} crawl visited only {count} pages vs {most} on the other device, "
+                    "so it most likely failed (blocked or rate limited) rather than finding a smaller menu"
+                )
+        return ""
+
+    def warnings(self) -> list[str]:
+        """Reasons the orphan list may contain pages that are actually linked."""
+        found = []
+        if self.truncated:
+            found.append(
+                f"The {' and '.join(self.truncated)} crawl stopped at --max-pages before visiting every page."
+            )
+        serious = self.serious_crawl_errors()
+        if serious:
+            found.append(
+                f"{len(serious)} pages failed to load during the crawl (see Crawl Errors); "
+                "pages linked only from them are reported as orphans."
+            )
+        imbalance = self.device_imbalance()
+        if imbalance:
+            found.append(imbalance + "; mobile-only/desktop-only links were not reliably checked.")
+        if self.unverified:
+            found.append(
+                f"{len(self.unverified)} unlinked pages stayed rate limited and could not be verified "
+                "(see Could Not Verify). Re-run later or with a higher --delay."
+            )
+        return found
+
     def one_device_only(self) -> list[tuple[DeclaredPage, str, str]]:
         """Declared pages linked on only one of the crawled profiles."""
         if len(self.profiles) < 2:
@@ -385,9 +481,20 @@ class OrphanFinder:
                 writer.writerow([page.title, page.url, ", ".join(sorted(page.sources))])
         self.log(f"CSV report saved to: {filename}")
 
+        if self.unverified:
+            unverified_file = filename.removesuffix(".csv") + "_unverified.csv"
+            with open(unverified_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["URL", "Status", "Found In"])
+                for page in self.unverified:
+                    writer.writerow([page.url, page.status, ", ".join(sorted(page.sources))])
+            self.log(f"Unverified pages saved to: {unverified_file}")
+
     def generate_html_report(self, filename: str):
         crawled = ", ".join(f"{n} {p}" for p, n in self.pages_crawled.items())
-        one_device = self.one_device_only()
+        imbalance = self.device_imbalance()
+        # A failed device crawl makes every page look "linked on one device only".
+        one_device = [] if imbalance else self.one_device_only()
 
         html = f"""<!DOCTYPE html>
 <html>
@@ -410,6 +517,8 @@ class OrphanFinder:
         tr:hover {{ background: #f8f9fa; }}
         td {{ word-break: break-word; }}
         .muted {{ color: #6c757d; font-size: 0.9em; }}
+        .warning {{ background: #fff3cd; color: #664d03; border: 1px solid #ffe69c; border-radius: 6px; padding: 12px 16px; }}
+        .warning ul {{ margin: 6px 0 0; padding-left: 20px; }}
     </style>
 </head>
 <body>
@@ -425,14 +534,16 @@ class OrphanFinder:
             <div class="stat"><div class="stat-number">{len(self.declared)}</div><div class="stat-label">Declared Pages</div></div>
             <div class="stat"><div class="stat-number">{sum(self.pages_crawled.values())}</div><div class="stat-label">Pages Crawled ({escape(crawled)})</div></div>
             <div class="stat"><div class="stat-number broken">{len(self.orphans)}</div><div class="stat-label">Orphan Pages</div></div>
+            <div class="stat"><div class="stat-number">{len(self.unverified)}</div><div class="stat-label">Could Not Verify</div></div>
             <div class="stat"><div class="stat-number">{len(self.not_live)}</div><div class="stat-label">Unlinked but Not Live</div></div>
             <div class="stat"><div class="stat-number">{len(self.crawl_errors)}</div><div class="stat-label">Crawl Errors</div></div>
         </div>
 """
-        if self.truncated:
+        warnings = self.warnings()
+        if warnings:
+            items = "".join(f"<li>{escape(w)}</li>" for w in warnings)
             html += f"""
-        <p class="broken"><strong>⚠️ The {" and ".join(self.truncated)} crawl stopped at --max-pages before visiting
-        every page, so some pages below may actually be linked. Run without --max-pages for a reliable list.</strong></p>
+        <div class="warning"><strong>⚠️ This list is not reliable yet:</strong><ul>{items}</ul></div>
 """
         if self.orphans:
             html += """
@@ -451,6 +562,23 @@ class OrphanFinder:
             html += "        </table>\n"
         else:
             html += "        <p>No orphan pages found. 🎉</p>\n"
+
+        if self.unverified:
+            html += """
+        <h2>Could Not Verify</h2>
+        <p class="muted">Declared and not linked, but the site kept answering "too many requests" when checked.
+        They are probably orphans: check them by hand or re-run with a higher --delay.</p>
+        <table>
+            <tr><th>URL</th><th>Status</th><th>Found In</th></tr>
+"""
+            for page in self.unverified:
+                html += f"""            <tr>
+                <td><a href="{escape(page.url)}" target="_blank" rel="noopener">{escape(page.url)}</a></td>
+                <td>{escape(str(page.status))}</td>
+                <td class="muted">{escape(", ".join(sorted(page.sources)))}</td>
+            </tr>
+"""
+            html += "        </table>\n"
 
         if self.not_live:
             html += """
@@ -489,7 +617,8 @@ class OrphanFinder:
         if self.crawl_errors:
             html += """
         <h2>Crawl Errors</h2>
-        <p class="muted">Pages that failed to load during the crawl. Links on them weren't seen, so orphans linked only from these pages may be false positives.</p>
+        <p class="muted">Pages that failed to load during the crawl. Links on them weren't seen, so orphans linked only
+        from these pages may be false positives (dead 4xx pages excepted).</p>
         <table>
             <tr><th>Device</th><th>URL</th><th>Error</th></tr>
 """
@@ -515,11 +644,12 @@ class OrphanFinder:
         for profile, count in self.pages_crawled.items():
             print(f"{'Crawled ' + profile + ':':<17}{count}")
         print(f"Orphan pages:    {len(self.orphans)}")
+        print(f"Unverified:      {len(self.unverified)}")
         print(f"Not live:        {len(self.not_live)}")
         print(f"Crawl errors:    {len(self.crawl_errors)}")
         print("=" * 60)
-        if self.truncated:
-            print("WARNING: crawl stopped at --max-pages; some orphans may be false positives.")
+        for warning in self.warnings():
+            print(f"WARNING: {warning}")
         if self.orphans:
             print("\nORPHAN PAGES:")
             for page in self.orphans:
@@ -559,6 +689,13 @@ def main():
         "--max-pages", type=int, default=0, help="Max pages to crawl per device (0 = unlimited, default: 0)"
     )
     parser.add_argument(
+        "--delay",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help="Pause between page loads to avoid rate limiting (default: 2; doubles after each 429, up to 10)",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=60000, help="Page load timeout in ms (default: 60000)"
     )
     parser.add_argument(
@@ -580,6 +717,7 @@ def main():
         max_pages=args.max_pages,
         timeout=args.timeout,
         skip_patterns=skip_patterns_from_args(args),
+        delay=args.delay,
         verbose=not args.quiet,
     )
 

@@ -210,7 +210,7 @@ A crawler can't discover orphan pages by following links (nothing links to them)
    - optionally, a page list exported from the CMS (`--pages-file pages.csv`).
 2. **Linked pages** — every page linked from a page reachable from the homepage. The site is crawled twice, **as desktop and as mobile** (phone screen and user agent), since sites can render different menus for each. Links hidden in collapsed menus count, as they are in the page.
 
-**Orphan = declared, not linked by either crawl, and loads with 200 on its own URL.** Declared pages that redirect or don't load are listed separately as *Unlinked but Not Live*.
+**Orphan = declared, not linked by either crawl, and loads with 200 on its own URL.** Declared pages that redirect or don't load are listed separately as *Unlinked but Not Live*; pages the site kept rate limiting are listed as *Could Not Verify*.
 
 Rules that matter:
 
@@ -228,12 +228,24 @@ python orphan_finder.py https://example.com --skip-inventory --pages-file cms_pa
 
 **Report**
 
-- **HTML**: summary (declared pages, pages crawled per device, orphans, not live, crawl errors), then:
+- **HTML**: summary (declared pages, pages loaded per device, orphans, could not verify, not live, crawl errors), then:
+  - **⚠️ This list is not reliable yet** — shown when the result can't be trusted as is: the crawl hit `--max-pages`, pages failed to load during the crawl (their links weren't seen), one device crawl loaded far fewer pages than the other (it failed, e.g. blocked on mobile), or pages couldn't be verified. **Don't send the list to a client while this box is shown**; fix the cause and re-run.
   - **Orphan Pages**: #, page title, live URL, where it was declared.
+  - **Could Not Verify**: unlinked pages that still answered 429/503 after retries. Probably orphans; check by hand or re-run with a higher `--delay`.
   - **Unlinked but Not Live**: status and redirect target.
-  - **Linked on One Device Only**: not orphans, but only reachable on desktop *or* mobile (e.g. a page only in the mobile menu). Useful context for the same request.
-  - **Crawl Errors**: pages that failed to load. Their links weren't seen, so orphans linked only from them may be false positives.
-- **CSV**: one row per orphan with `Page Title`, `Live URL`, `Found In`, ready to send to the client (drop `Found In` if not needed).
+  - **Linked on One Device Only**: not orphans, but only reachable on desktop *or* mobile (e.g. a page only in the mobile menu). Hidden when a device crawl failed, since every page would show up here.
+  - **Crawl Errors**: pages that failed to load during the crawl (HTTP errors, rate limits, timeouts).
+- **CSV**: one row per orphan with `Page Title`, `Live URL`, `Found In`, ready to send to the client (drop `Found In` if not needed). Unverified pages go to `<output>_unverified.csv`.
+
+**Rate limiting**
+
+Dealer sites (and CDNs in general) answer `429 Too Many Requests` when pages are loaded too fast, and a rate-limited page looks like a page with no links. The tool therefore:
+
+- waits `--delay` seconds between page loads (default 2);
+- on a 429/503, waits (`Retry-After` if the site sends it, else 15 s, 45 s, 90 s) and retries up to 3 times, and doubles the delay for the rest of the run (up to 10 s);
+- records pages that still fail as crawl errors or *Could Not Verify*, and warns.
+
+If the report still shows rate-limit warnings, re-run with a higher delay, e.g. `--delay 5`. A full run of a ~300-page dealer site takes roughly 30–60 minutes for both devices.
 
 **Options**
 
@@ -244,6 +256,7 @@ python orphan_finder.py https://example.com --skip-inventory --pages-file cms_pa
 | `--xml-sitemap URL` | `<site>/sitemap.xml` + `robots.txt` | XML sitemap(s); repeatable. |
 | `--pages-file FILE` | — | Extra declared pages, e.g. a CMS export. |
 | `--desktop-only` | off | Skip the mobile crawl (about twice as fast). |
+| `--delay SECONDS` | `2` | Pause between page loads; doubles after each 429 (up to 10). Raise it if you still get rate limited. |
 | `--max-pages N` | `0` (unlimited) | Max pages per device crawl. **Leave unlimited for real audits**: a cut-short crawl reports linked pages as orphans (the report warns when this happens). |
 | `--timeout MS` | `60000` | Page load timeout. |
 | `-o`, `-f`, `-q` | | Output path, format and quiet mode, as in `site_auditor.py`. |
