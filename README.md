@@ -208,7 +208,7 @@ A crawler can't discover orphan pages by following links (nothing links to them)
    - the HTML sitemap (`/sitemap.htm`, or `--html-sitemap URL`),
    - the XML sitemap (`/sitemap.xml` plus any `Sitemap:` listed in `robots.txt`, or `--xml-sitemap URL`; sitemap indexes are followed),
    - optionally, a page list exported from the CMS (`--pages-file pages.csv`).
-2. **Linked pages** — every page linked from a page reachable from the homepage. The site is crawled twice, **as desktop and as mobile** (phone screen and user agent), since sites can render different menus for each. Links hidden in collapsed menus count, as they are in the page.
+2. **Linked pages** — every page linked from a page reachable from the homepage. The site is crawled twice, **as desktop and as mobile** (phone screen and a Chrome-on-Android user agent), since sites can render different menus for each. Links hidden in collapsed menus count, as they are in the page.
 
 **Orphan = declared, not linked by either crawl, and loads with 200 on its own URL.** Declared pages that redirect or don't load are listed separately as *Unlinked but Not Live*; pages the site kept rate limiting are listed as *Could Not Verify*.
 
@@ -243,6 +243,7 @@ Dealer sites (and CDNs in general) answer `429 Too Many Requests` when pages are
 
 - waits `--delay` seconds between page loads (default 2);
 - on a 429/503, waits (`Retry-After` if the site sends it, else 15 s, 45 s, 90 s) and retries up to 3 times, and doubles the delay for the rest of the run (up to 10 s);
+- retries pages that are still rate limited once more at the end, after a 60 s pause;
 - records pages that still fail as crawl errors or *Could Not Verify*, and warns.
 
 If the report still shows rate-limit warnings, re-run with a higher delay, e.g. `--delay 5`. A full run of a ~300-page dealer site takes roughly 30–60 minutes for both devices.
