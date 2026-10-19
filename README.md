@@ -241,6 +241,7 @@ python orphan_finder.py https://example.com --skip-inventory --pages-file cms_pa
 
 Dealer sites (and CDNs in general) answer `429 Too Many Requests` when pages are loaded too fast, and a rate-limited page looks like a page with no links. The tool therefore:
 
+- **doesn't load images** (a dealer page has dozens; skipping them cuts requests per page ~10x without changing the links found; `--load-images` turns them back on);
 - waits `--delay` seconds between page loads (default 2);
 - on a 429/503, waits (`Retry-After` if the site sends it, else 15 s, 45 s, 90 s) and retries up to 3 times, and doubles the delay for the rest of the run (up to 10 s);
 - retries pages that are still rate limited once more at the end, after a 60 s pause;
@@ -258,6 +259,9 @@ If the report still shows rate-limit warnings, re-run with a higher delay, e.g. 
 | `--pages-file FILE` | — | Extra declared pages, e.g. a CMS export. |
 | `--desktop-only` | off | Skip the mobile crawl (about twice as fast). |
 | `--delay SECONDS` | `2` | Pause between page loads; doubles after each 429 (up to 10). Raise it if you still get rate limited. |
+| `--load-images` | off | Load images too (more requests, more rate limiting; not needed to find links). |
+| `--chrome` | off | Use your installed Google Chrome instead of Playwright's Chromium. Real Chrome is less likely to be blocked (403) by bot protection. |
+| `--headful` | off | Show the browser window while it crawls. Useful to watch it; it doesn't avoid rate limits. |
 | `--max-pages N` | `0` (unlimited) | Max pages per device crawl. **Leave unlimited for real audits**: a cut-short crawl reports linked pages as orphans (the report warns when this happens). |
 | `--timeout MS` | `60000` | Page load timeout. |
 | `-o`, `-f`, `-q` | | Output path, format and quiet mode, as in `site_auditor.py`. |

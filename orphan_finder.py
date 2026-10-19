@@ -107,6 +107,9 @@ class OrphanFinder:
         timeout: int = 60000,
         skip_patterns: list[str] | None = None,
         delay: float = 2.0,
+        load_images: bool = False,
+        headful: bool = False,
+        use_chrome: bool = False,
         verbose: bool = True,
     ):
         parsed = urlparse(base_url)
@@ -125,6 +128,9 @@ class OrphanFinder:
         self.skip_patterns = compile_skip_patterns(skip_patterns)
         self.verbose = verbose
         self.delay = delay
+        self.load_images = load_images
+        self.headful = headful
+        self.use_chrome = use_chrome
         self._last_request = 0.0
 
         self.sitemap_keys = {self.page_key(u) for u in self.html_sitemaps}
@@ -425,6 +431,20 @@ class OrphanFinder:
         self.orphans.sort(key=lambda p: p.url)
         context.close()
 
+    def launch_browser(self, playwright):
+        """Chromium (or installed Chrome) with images off unless asked.
+
+        A page load fetches every image too: ~10x the requests of the HTML
+        alone, which is what trips the site's rate limit. Links don't need them.
+        Turning images off this way, unlike request interception, keeps the
+        browser cache, so scripts and styles aren't re-downloaded on every page.
+        """
+        args = [] if self.load_images else ["--blink-settings=imagesEnabled=false"]
+        options = {"headless": not self.headful, "args": args}
+        if self.use_chrome:
+            options["channel"] = "chrome"
+        return playwright.chromium.launch(**options)
+
     def run(self):
         if sync_playwright is None:
             raise RuntimeError(PLAYWRIGHT_MISSING)
@@ -434,7 +454,7 @@ class OrphanFinder:
         self.collect_pages_file()
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = self.launch_browser(p)
             self.collect_html_sitemaps(browser.new_context(**PROFILES["desktop"]))
             self.log(f"{len(self.declared)} declared pages in total")
             if not self.declared:
@@ -737,6 +757,19 @@ def main():
         help="Pause between page loads to avoid rate limiting (default: 2; doubles after each 429, up to 10)",
     )
     parser.add_argument(
+        "--load-images",
+        action="store_true",
+        help="Load images too (off by default: they multiply requests and trigger rate limits)",
+    )
+    parser.add_argument(
+        "--headful", action="store_true", help="Show the browser window instead of running headless"
+    )
+    parser.add_argument(
+        "--chrome",
+        action="store_true",
+        help="Use the installed Google Chrome instead of the bundled Chromium (less likely to be blocked)",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=60000, help="Page load timeout in ms (default: 60000)"
     )
     parser.add_argument(
@@ -759,6 +792,9 @@ def main():
         timeout=args.timeout,
         skip_patterns=skip_patterns_from_args(args),
         delay=args.delay,
+        load_images=args.load_images,
+        headful=args.headful,
+        use_chrome=args.chrome,
         verbose=not args.quiet,
     )
 
